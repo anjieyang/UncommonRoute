@@ -34,10 +34,20 @@ def select_model(
     prompt: str = "",
     pricing: dict[str, ModelPricing] | None = None,
     agentic_score: float = 0.0,
+    user_keyed_models: set[str] | None = None,
 ) -> RoutingDecision:
     pricing = pricing or DEFAULT_MODEL_PRICING
     tc = tier_configs[tier]
     model = tc.primary
+
+    # BYOK: if user has an API key for a model in this tier, prefer it
+    if user_keyed_models:
+        candidates = [tc.primary, *tc.fallback]
+        for candidate in candidates:
+            if candidate in user_keyed_models:
+                model = candidate
+                reasoning = f"byok-preferred ({model}) | {reasoning}"
+                break
 
     # R2-Router: estimate optimal output budget from prompt + tier
     budget = estimate_output_budget(prompt, tier.value)

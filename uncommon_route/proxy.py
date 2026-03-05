@@ -39,6 +39,7 @@ from uncommon_route.session import (
     hash_request_content,
 )
 from uncommon_route.spend_control import SpendControl
+from uncommon_route.providers import ProvidersConfig, load_providers
 
 VERSION = "0.1.0"
 DEFAULT_UPSTREAM = os.environ.get("UNCOMMON_ROUTE_UPSTREAM", "https://openrouter.ai/api/v1")
@@ -170,6 +171,7 @@ def create_app(
     upstream: str = DEFAULT_UPSTREAM,
     session_store: SessionStore | None = None,
     spend_control: SpendControl | None = None,
+    providers_config: ProvidersConfig | None = None,
 ) -> Starlette:
     """Create the ASGI application wired to the given upstream base URL.
 
@@ -177,9 +179,11 @@ def create_app(
         upstream: Base URL for the upstream OpenAI-compatible API.
         session_store: Optional SessionStore for sticky sessions.
         spend_control: Optional SpendControl for spending limits.
+        providers_config: Optional BYOK provider config for user-keyed models.
     """
     _sessions = session_store or SessionStore()
     _spend = spend_control or SpendControl()
+    _providers = providers_config or load_providers()
 
     upstream_chat = f"{upstream.rstrip('/')}/chat/completions"
 
@@ -201,6 +205,11 @@ def create_app(
                 "spent": spend_status.spent,
                 "remaining": {k: v for k, v in spend_status.remaining.items() if v is not None},
                 "calls": spend_status.calls,
+            },
+            "providers": {
+                "count": len(_providers.providers),
+                "names": _providers.provider_names(),
+                "keyed_models": sorted(_providers.keyed_models()),
             },
         })
 
@@ -268,7 +277,8 @@ def create_app(
                             selected_model, tier_value = result
                             reasoning = f"escalated ({tier_value})"
             else:
-                decision = route(prompt, system_prompt, max_tokens)
+                user_keyed = _providers.keyed_models() or None
+                decision = route(prompt, system_prompt, max_tokens, user_keyed_models=user_keyed)
                 selected_model = decision.model
                 tier_value = decision.tier.value
                 reasoning = decision.reasoning
@@ -286,6 +296,13 @@ def create_app(
             tier_value = ""
             reasoning = "passthrough"
 
+        # BYOK: if user has a key for this model, route to their provider directly
+        provider_entry = _providers.get_for_model(selected_model)
+        if provider_entry and provider_entry.base_url:
+            target_chat_url = f"{provider_entry.base_url.rstrip('/')}/chat/completions"
+        else:
+            target_chat_url = upstream_chat
+
         fwd_headers: dict[str, str] = {}
         for key in ("authorization", "content-type", "accept", "user-agent"):
             val = request.headers.get(key)
@@ -294,6 +311,13 @@ def create_app(
         if "content-type" not in fwd_headers:
             fwd_headers["content-type"] = "application/json"
         fwd_headers["user-agent"] = f"uncommon-route/{VERSION}"
+
+        # BYOK: override auth header with user's API key
+        if provider_entry:
+            fwd_headers["authorization"] = f"Bearer {provider_entry.api_key}"
+            # Strip provider prefix for direct API calls (e.g. "deepseek/deepseek-chat" → "deepseek-chat")
+            raw_model = selected_model.split("/", 1)[-1] if "/" in selected_model else selected_model
+            body["model"] = raw_model
 
         debug_headers: dict[str, str] = {}
         if is_virtual:
@@ -304,7 +328,7 @@ def create_app(
         try:
             if is_streaming:
                 async def sse_passthrough() -> AsyncGenerator[bytes, None]:
-                    async for chunk in _stream_upstream(upstream_chat, body, fwd_headers):
+                    async for chunk in _stream_upstream(target_chat_url, body, fwd_headers):
                         yield chunk
 
                 return StreamingResponse(
@@ -318,7 +342,7 @@ def create_app(
                 )
 
             client = _get_client()
-            resp = await client.post(upstream_chat, json=body, headers=fwd_headers)
+            resp = await client.post(target_chat_url, json=body, headers=fwd_headers)
 
             if is_virtual:
                 _spend.record(0.001, model=selected_model, action="chat")

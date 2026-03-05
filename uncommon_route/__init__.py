@@ -37,6 +37,15 @@ from uncommon_route.spend_control import (
 from uncommon_route.openclaw import install as openclaw_install
 from uncommon_route.openclaw import uninstall as openclaw_uninstall
 from uncommon_route.openclaw import status as openclaw_status
+from uncommon_route.providers import (
+    ProvidersConfig,
+    ProviderEntry,
+    add_provider,
+    load_providers,
+    remove_provider,
+    save_providers,
+    select_preferred_model,
+)
 
 __all__ = [
     # Router
@@ -76,4 +85,12 @@ __all__ = [
     "openclaw_install",
     "openclaw_uninstall",
     "openclaw_status",
+    # Providers (BYOK)
+    "ProvidersConfig",
+    "ProviderEntry",
+    "add_provider",
+    "load_providers",
+    "remove_provider",
+    "save_providers",
+    "select_preferred_model",
 ]

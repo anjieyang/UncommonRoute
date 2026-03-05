@@ -36,6 +36,7 @@ Usage:
   uncommon-route debug <prompt>         Show per-dimension scoring breakdown
   uncommon-route openclaw <sub>         OpenClaw integration (install|uninstall|status)
   uncommon-route spend <sub>            Spending limits (status|set|clear|history)
+  uncommon-route provider <sub>          API key management (list|add|remove|models)
   uncommon-route sessions               Show active session stats
   uncommon-route --version              Show version
 
@@ -54,6 +55,12 @@ OpenClaw subcommands:
   openclaw uninstall                  Remove from OpenClaw
   openclaw status                     Check registration
 
+Provider subcommands:
+  provider list                         Show configured API keys
+  provider add <name> <key>             Add key (e.g. deepseek, minimax, openai)
+  provider remove <name>                Remove a key
+  provider models                       List user-keyed models
+
 Spend subcommands:
   spend status                        Show spending status & limits
   spend set <window> <amount>         Set limit (window: per_request|hourly|daily|session)
@@ -66,6 +73,8 @@ Examples:
   uncommon-route openclaw install
   uncommon-route spend set hourly 5.00
   uncommon-route spend status
+  uncommon-route provider add deepseek sk-...
+  uncommon-route provider add minimax eyJ... --plan coding-plan
 """)
 
 
@@ -268,6 +277,11 @@ def _cmd_spend(args: list[str]) -> None:
         sys.exit(1)
 
 
+def _cmd_provider(args: list[str]) -> None:
+    from uncommon_route.providers import cmd_provider
+    cmd_provider(args)
+
+
 def _cmd_sessions(args: list[str]) -> None:
     from uncommon_route.session import SessionStore
     store = SessionStore()
@@ -300,6 +314,7 @@ def main() -> None:
         "debug": _cmd_debug,
         "openclaw": _cmd_openclaw,
         "spend": _cmd_spend,
+        "provider": _cmd_provider,
         "sessions": _cmd_sessions,
     }
 
