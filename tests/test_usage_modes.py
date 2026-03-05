@@ -262,7 +262,7 @@ class TestSessionManagement:
         reasoning2 = r2.headers.get("x-uncommon-route-reasoning", "")
 
         assert model1 == model2
-        assert "session-sticky" in reasoning2
+        assert "session-hold" in reasoning2
 
     def test_sessions_endpoint(self) -> None:
         ss = SessionStore(SessionConfig(enabled=True, timeout_s=300))

@@ -4,23 +4,24 @@ Users configure their own API keys and subscription plans.
 When routing, models backed by a user-provided key are prioritized
 since the user already pays for them.
 
-Config stored at ~/.uncommon-route/providers.yaml
+Config stored at ~/.uncommon-route/providers.json
 
-Example:
-    providers:
-      minimax:
-        api_key: "eyJ..."
-        base_url: "https://api.minimax.chat/v1/text/chatcompletion_v2"
-        models:
-          - minimax/minimax-m2.5
-        plan: "coding-plan"
-
-      deepseek:
-        api_key: "sk-..."
-        base_url: "https://api.deepseek.com/v1"
-        models:
-          - deepseek/deepseek-chat
-          - deepseek/deepseek-reasoner
+Example (providers.json):
+    {
+      "providers": {
+        "minimax": {
+          "api_key": "eyJ...",
+          "base_url": "https://api.minimax.chat/v1",
+          "models": ["minimax/minimax-m2.5"],
+          "plan": "coding-plan"
+        },
+        "deepseek": {
+          "api_key": "sk-...",
+          "base_url": "https://api.deepseek.com/v1",
+          "models": ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"]
+        }
+      }
+    }
 """
 
 from __future__ import annotations

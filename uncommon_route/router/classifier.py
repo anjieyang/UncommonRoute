@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import math
 import re
+from pathlib import Path
 
 from uncommon_route.router.types import (
     ScoringConfig,
@@ -37,26 +38,70 @@ from uncommon_route.router.learned import ScriptAgnosticClassifier
 _model: ScriptAgnosticClassifier | None = None
 _model_load_attempted = False
 
+def _get_online_model_path() -> Path:
+    return Path.home() / ".uncommon-route" / "model_online.json"
+
 
 def _ensure_model_loaded() -> None:
     global _model, _model_load_attempted
     if _model_load_attempted:
         return
     _model_load_attempted = True
-    from pathlib import Path
+    online = _get_online_model_path()
     default = Path(__file__).parent / "model.json"
-    if default.exists():
+    if online.exists():
+        _model = ScriptAgnosticClassifier()
+        _model.load(online)
+    elif default.exists():
         _model = ScriptAgnosticClassifier()
         _model.load(default)
 
 
 def load_learned_model(path: str | None = None) -> None:
     global _model
-    from pathlib import Path
-    p = Path(path) if path else Path(__file__).parent / "model.json"
+    p = Path(path) if path else (Path(__file__).parent / "model.json")
     if p.exists():
         _model = ScriptAgnosticClassifier()
         _model.load(p)
+
+
+def extract_features(prompt: str, system_prompt: str | None = None) -> dict[str, float]:
+    """Public API: extract the full 39-dim feature vector for a prompt."""
+    _ensure_model_loaded()
+    full_text = f"{system_prompt or ''} {prompt}".strip()
+    return _extract_all_features(prompt, full_text)
+
+
+def update_model(features: dict[str, float], correct_tier: str) -> bool:
+    """Apply one online Perceptron update. Returns True if model exists."""
+    _ensure_model_loaded()
+    if _model is None:
+        return False
+    _model.update(features, correct_tier)
+    return True
+
+
+def save_online_model(path: Path | None = None) -> None:
+    """Persist current weights to the online model file."""
+    if _model is None:
+        return
+    p = path or _get_online_model_path()
+    p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _model.save(p)
+
+
+def rollback_online_model() -> bool:
+    """Delete online weights and reload base model. Returns True if file was deleted."""
+    global _model, _model_load_attempted
+    p = _get_online_model_path()
+    deleted = False
+    if p.exists():
+        p.unlink()
+        deleted = True
+    _model = None
+    _model_load_attempted = False
+    _ensure_model_loaded()
+    return deleted
 
 
 def _extract_all_features(prompt: str, full_text: str) -> dict[str, float]:
@@ -90,7 +135,6 @@ def _extract_all_features(prompt: str, full_text: str) -> dict[str, float]:
 def train_and_save_model(data_path: str, out_path: str | None = None) -> None:
     """Train model from JSONL data."""
     import json
-    from pathlib import Path
 
     cases = []
     with open(data_path, "r", encoding="utf-8") as f:

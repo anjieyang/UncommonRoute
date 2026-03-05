@@ -6,6 +6,8 @@ Subcommands:
     debug    — show per-dimension scoring breakdown
     openclaw — manage OpenClaw integration (install/uninstall/status)
     spend    — manage spending limits (set/clear/status/history)
+    provider — API key management (BYOK)
+    stats    — routing analytics (summary/history/reset)
     sessions — show active session stats
 
 Global flags:
@@ -37,6 +39,7 @@ Usage:
   uncommon-route openclaw <sub>         OpenClaw integration (install|uninstall|status)
   uncommon-route spend <sub>            Spending limits (status|set|clear|history)
   uncommon-route provider <sub>          API key management (list|add|remove|models)
+  uncommon-route stats [sub]            Routing analytics (summary|history|reset)
   uncommon-route sessions               Show active session stats
   uncommon-route --version              Show version
 
@@ -66,6 +69,12 @@ Spend subcommands:
   spend set <window> <amount>         Set limit (window: per_request|hourly|daily|session)
   spend clear <window>                Remove a limit
   spend history [--limit <n>]         Show recent spending records
+
+Stats subcommands:
+  stats                               Show routing summary (default)
+  stats summary                       Same as above
+  stats history [--limit <n>]         Recent routing decisions
+  stats reset                         Clear all stats
 
 Examples:
   uncommon-route route "what is 2+2"
@@ -282,6 +291,78 @@ def _cmd_provider(args: list[str]) -> None:
     cmd_provider(args)
 
 
+def _cmd_stats(args: list[str]) -> None:
+    from uncommon_route.stats import RouteStats
+
+    rs = RouteStats()
+    if not args:
+        args = ["summary"]
+    sub = args[0]
+
+    if sub == "summary":
+        s = rs.summary()
+        if s.total_requests == 0:
+            print("  No routing data recorded yet.")
+            print("  Start the proxy with `uncommon-route serve` and send requests.")
+            return
+        hours = s.time_range_s / 3600
+        print(f"\n  Routing Statistics ({hours:.1f}h window, {s.total_requests} requests)")
+        print(f"  {'─' * 50}")
+        print(f"  Avg confidence: {s.avg_confidence:.2f}")
+        print(f"  Avg savings:    {s.avg_savings:.0%}")
+        print(f"  Avg latency:    {s.avg_latency_us:.0f}µs")
+        print(f"  Total cost:     ${s.total_actual_cost:.4f} (estimated: ${s.total_estimated_cost:.4f})")
+
+        if s.by_tier:
+            print(f"\n  By Tier:")
+            for tier in ("SIMPLE", "MEDIUM", "COMPLEX", "REASONING"):
+                ts = s.by_tier.get(tier)
+                if not ts:
+                    continue
+                pct = ts.count / s.total_requests * 100
+                print(
+                    f"    {tier:<10} │ {ts.count:>5} ({pct:4.1f}%)"
+                    f"  │ conf: {ts.avg_confidence:.2f}"
+                    f"  │ savings: {ts.avg_savings:.0%}"
+                    f"  │ ${ts.total_cost:.4f}"
+                )
+
+        if s.by_model:
+            print(f"\n  By Model:")
+            ranked = sorted(s.by_model.items(), key=lambda x: -x[1].count)
+            for model, ms in ranked[:8]:
+                print(f"    {model:<40} {ms.count:>5} reqs  ${ms.total_cost:.4f}")
+
+        if s.by_method:
+            print(f"\n  By Method:")
+            for method, count in sorted(s.by_method.items(), key=lambda x: -x[1]):
+                pct = count / s.total_requests * 100
+                print(f"    {method:<20} {count:>5} ({pct:.1f}%)")
+        print()
+
+    elif sub == "history":
+        flags, _ = _parse_flags(args[1:], {"limit": True})
+        limit = int(flags.get("limit", 20))
+        records = rs.history(limit=limit)
+        if not records:
+            print("  No routing records")
+            return
+        print(f"  Recent routing decisions ({len(records)} records):")
+        for r in records:
+            ts = time.strftime("%H:%M:%S", time.localtime(r.timestamp))
+            cost_str = f"${r.actual_cost:.6f}" if r.actual_cost is not None else f"~${r.estimated_cost:.6f}"
+            print(f"    {ts}  {r.tier:<10} {r.model:<35} {cost_str}  [{r.method}]")
+
+    elif sub == "reset":
+        rs.reset()
+        print("  Stats reset")
+
+    else:
+        print(f"Unknown stats subcommand: {sub}", file=sys.stderr)
+        print("  Available: summary, history, reset", file=sys.stderr)
+        sys.exit(1)
+
+
 def _cmd_sessions(args: list[str]) -> None:
     from uncommon_route.session import SessionStore
     store = SessionStore()
@@ -315,6 +396,7 @@ def main() -> None:
         "openclaw": _cmd_openclaw,
         "spend": _cmd_spend,
         "provider": _cmd_provider,
+        "stats": _cmd_stats,
         "sessions": _cmd_sessions,
     }
 

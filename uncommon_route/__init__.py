@@ -46,6 +46,21 @@ from uncommon_route.providers import (
     save_providers,
     select_preferred_model,
 )
+from uncommon_route.feedback import (
+    FeedbackCollector,
+    FeedbackResult,
+    FeedbackSignal,
+)
+from uncommon_route.stats import (
+    RouteRecord,
+    RouteStats,
+    RouteStatsStorage,
+    FileRouteStatsStorage,
+    InMemoryRouteStatsStorage,
+    StatsSummary,
+    TierSummary,
+    ModelSummary,
+)
 
 __all__ = [
     # Router
@@ -93,4 +108,17 @@ __all__ = [
     "remove_provider",
     "save_providers",
     "select_preferred_model",
+    # Feedback
+    "FeedbackCollector",
+    "FeedbackResult",
+    "FeedbackSignal",
+    # Stats
+    "RouteRecord",
+    "RouteStats",
+    "RouteStatsStorage",
+    "FileRouteStatsStorage",
+    "InMemoryRouteStatsStorage",
+    "StatsSummary",
+    "TierSummary",
+    "ModelSummary",
 ]

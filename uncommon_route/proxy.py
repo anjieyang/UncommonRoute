@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from typing import Any, AsyncGenerator
 
 import httpx
@@ -29,8 +30,9 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from uncommon_route.router.api import route
-from uncommon_route.router.classifier import classify
+from uncommon_route.router.classifier import classify, extract_features
 from uncommon_route.router.config import DEFAULT_CONFIG, DEFAULT_MODEL_PRICING
+from uncommon_route.router.structural import estimate_tokens, estimate_output_budget
 from uncommon_route.router.types import Tier
 from uncommon_route.session import (
     SessionStore,
@@ -39,6 +41,8 @@ from uncommon_route.session import (
     hash_request_content,
 )
 from uncommon_route.spend_control import SpendControl
+from uncommon_route.stats import RouteRecord, RouteStats
+from uncommon_route.feedback import FeedbackCollector
 from uncommon_route.providers import ProvidersConfig, load_providers
 
 VERSION = "0.1.0"
@@ -51,6 +55,33 @@ VIRTUAL_MODELS = [
 ]
 
 _http_client: httpx.AsyncClient | None = None
+
+
+def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Compute dollar cost from token counts using the model pricing table."""
+    mp = DEFAULT_MODEL_PRICING.get(model)
+    if mp is None:
+        return 0.0
+    return (input_tokens / 1_000_000) * mp.input_price + (output_tokens / 1_000_000) * mp.output_price
+
+
+def _parse_usage_cost(content: bytes, model: str) -> float | None:
+    """Extract actual cost from an upstream response's ``usage`` field.
+
+    Returns None when the response is unparseable or lacks token counts.
+    """
+    try:
+        data = json.loads(content)
+        usage = data.get("usage")
+        if not usage:
+            return None
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        if prompt_tokens == 0 and completion_tokens == 0:
+            return None
+        return _estimate_cost(model, prompt_tokens, completion_tokens)
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return None
 
 
 def _get_client() -> httpx.AsyncClient:
@@ -138,19 +169,71 @@ async def _stream_upstream(
             yield chunk
 
 
+_OPENCLAW_SESSION_HEADER = "x-openclaw-session-key"
+
+
 def _resolve_session(
     request: Request,
     body: dict,
     session_store: SessionStore,
 ) -> str | None:
-    """Resolve session ID from header or message content."""
-    header_name = session_store.config.header_name
+    """Resolve session ID from header or message content.
+
+    Checks (in order): configured header (x-session-id), OpenClaw's
+    session header (x-openclaw-session-key), then derives from the first
+    user message as a last resort.
+    """
     raw_headers = {k: v for k, v in request.headers.items()}
-    sid = get_session_id(raw_headers, header_name)
+    sid = get_session_id(raw_headers, session_store.config.header_name)
+    if sid:
+        return sid
+    sid = get_session_id(raw_headers, _OPENCLAW_SESSION_HEADER)
     if sid:
         return sid
     messages = body.get("messages", [])
     return derive_session_id(messages)
+
+
+_TIER_RANK: dict[str, int] = {"SIMPLE": 0, "MEDIUM": 1, "COMPLEX": 2, "REASONING": 3}
+
+
+def _classify_step(body: dict) -> tuple[str, list[str]]:
+    """Classify the current agentic step from the request body.
+
+    Returns (step_type, tool_names) where step_type is one of:
+      - "tool-result-followup": last message is a tool result
+      - "tool-selection": tools available, last message is from user
+      - "general": no agentic signals
+
+    tool_names: function names from the tools array (for hash differentiation).
+
+    Checks both ``tools`` (standard OpenAI) and ``customTools`` (OpenClaw's
+    internal format when ``compat.openaiCompletionsTools`` is not enabled).
+    """
+    messages = body.get("messages", [])
+    raw_tools: list[dict[str, Any]] = body.get("tools") or body.get("customTools") or []
+    has_tools = bool(raw_tools)
+
+    tool_names: list[str] = []
+    for t in raw_tools:
+        fn = t.get("function") or t.get("definition") or {}
+        name = fn.get("name", "")
+        if name:
+            tool_names.append(name)
+
+    last_role = ""
+    for msg in reversed(messages):
+        if msg.get("role") != "system":
+            last_role = msg.get("role", "")
+            break
+
+    if last_role == "tool":
+        return "tool-result-followup", tool_names
+
+    if has_tools and last_role == "user":
+        return "tool-selection", tool_names
+
+    return "general", tool_names
 
 
 def _spend_error(result: Any) -> JSONResponse:
@@ -172,6 +255,8 @@ def create_app(
     session_store: SessionStore | None = None,
     spend_control: SpendControl | None = None,
     providers_config: ProvidersConfig | None = None,
+    route_stats: RouteStats | None = None,
+    feedback: FeedbackCollector | None = None,
 ) -> Starlette:
     """Create the ASGI application wired to the given upstream base URL.
 
@@ -180,10 +265,14 @@ def create_app(
         session_store: Optional SessionStore for sticky sessions.
         spend_control: Optional SpendControl for spending limits.
         providers_config: Optional BYOK provider config for user-keyed models.
+        route_stats: Optional RouteStats for per-request analytics.
+        feedback: Optional FeedbackCollector for online learning.
     """
     _sessions = session_store or SessionStore()
     _spend = spend_control or SpendControl()
     _providers = providers_config or load_providers()
+    _stats = route_stats or RouteStats()
+    _feedback = feedback or FeedbackCollector()
 
     upstream_chat = f"{upstream.rstrip('/')}/chat/completions"
 
@@ -210,6 +299,14 @@ def create_app(
                 "count": len(_providers.providers),
                 "names": _providers.provider_names(),
                 "keyed_models": sorted(_providers.keyed_models()),
+            },
+            "stats": {
+                "total_requests": _stats.count,
+            },
+            "feedback": {
+                "pending": _feedback.pending_count,
+                "total_updates": _feedback.total_updates,
+                "online_model": _feedback.online_model_active,
             },
         })
 
@@ -245,12 +342,78 @@ def create_app(
         """GET /v1/sessions — list active sessions."""
         return JSONResponse(_sessions.stats())
 
+    async def handle_stats(request: Request) -> JSONResponse:
+        """GET /v1/stats — route analytics. POST /v1/stats — reset."""
+        if request.method == "POST":
+            body = await request.json()
+            if body.get("action") == "reset":
+                _stats.reset()
+                return JSONResponse({"ok": True, "reset": True})
+            return JSONResponse({"error": "Invalid action"}, status_code=400)
+        s = _stats.summary()
+        return JSONResponse({
+            "total_requests": s.total_requests,
+            "time_range_s": round(s.time_range_s, 1),
+            "avg_confidence": round(s.avg_confidence, 3),
+            "avg_savings": round(s.avg_savings, 3),
+            "avg_latency_us": round(s.avg_latency_us, 1),
+            "total_estimated_cost": round(s.total_estimated_cost, 6),
+            "total_actual_cost": round(s.total_actual_cost, 6),
+            "by_tier": {
+                tier: {
+                    "count": ts.count,
+                    "avg_confidence": round(ts.avg_confidence, 3),
+                    "avg_savings": round(ts.avg_savings, 3),
+                    "total_cost": round(ts.total_cost, 6),
+                }
+                for tier, ts in s.by_tier.items()
+            },
+            "by_model": {
+                model: {"count": ms.count, "total_cost": round(ms.total_cost, 6)}
+                for model, ms in s.by_model.items()
+            },
+            "by_method": s.by_method,
+        })
+
+    async def handle_feedback(request: Request) -> JSONResponse:
+        """GET /v1/feedback — status. POST /v1/feedback — submit signal or rollback."""
+        if request.method == "GET":
+            return JSONResponse(_feedback.status())
+        body = await request.json()
+        action = body.get("action")
+        if action == "rollback":
+            rolled = _feedback.rollback()
+            return JSONResponse({"ok": True, "rolled_back": rolled})
+        request_id = body.get("request_id", "")
+        signal = body.get("signal", "")
+        if not request_id or signal not in ("weak", "strong", "ok"):
+            return JSONResponse(
+                {"error": "Requires request_id and signal (weak|strong|ok)"},
+                status_code=400,
+            )
+        result = _feedback.submit(request_id, signal)
+        return JSONResponse({
+            "ok": result.ok,
+            "action": result.action,
+            "from_tier": result.from_tier,
+            "to_tier": result.to_tier,
+            **({"reason": result.reason} if result.reason else {}),
+            "total_updates": _feedback.total_updates,
+        }, status_code=200 if result.ok else 404)
+
     async def handle_chat_completions(request: Request) -> Response:
         body = await request.json()
         model = (body.get("model") or "").strip().lower()
         is_streaming = body.get("stream", False)
 
         is_virtual = model == VIRTUAL_MODEL
+        route_start = time.perf_counter_ns()
+        route_method: str = "cascade"
+        confidence = 0.0
+        savings = 0.0
+        estimated_cost = 0.0
+        session_id: str | None = None
+        request_id = ""
 
         if is_virtual:
             prompt, system_prompt, max_tokens = _extract_prompt(body)
@@ -262,39 +425,94 @@ def create_app(
 
             session_id = _resolve_session(request, body, _sessions)
             cached_session = _sessions.get(session_id) if session_id else None
+            step_type, tool_names = _classify_step(body)
+            is_lightweight = step_type == "tool-result-followup"
 
-            if cached_session and not cached_session.escalated:
-                selected_model = cached_session.model
-                tier_value = cached_session.tier
-                reasoning = f"session-sticky ({session_id[:8]}...)"
+            # Always route — classifier decides tier based on current content
+            user_keyed = _providers.keyed_models() or None
+            decision = route(prompt, system_prompt, max_tokens, user_keyed_models=user_keyed)
+            selected_model = decision.model
+            tier_value = decision.tier.value
+            reasoning = decision.reasoning
+            estimated_cost = decision.cost_estimate
+            confidence = decision.confidence
+            savings = decision.savings
+            route_method = "cascade"
+
+            if cached_session:
+                session_rank = _TIER_RANK.get(cached_session.tier, 1)
+                decision_rank = _TIER_RANK.get(decision.tier.value, 1)
+
+                if is_lightweight:
+                    # Tool-result steps: use classifier's decision (allow downgrade)
+                    route_method = "step-aware"
+                    reasoning = f"{decision.reasoning} | {step_type}"
+                elif decision_rank > session_rank:
+                    # Higher tier needed: upgrade session
+                    route_method = "session-upgrade"
+                    reasoning = f"{decision.reasoning} | upgrade {cached_session.tier}->{tier_value}"
+                    if session_id:
+                        _sessions.set(session_id, selected_model, tier_value)
+                else:
+                    # Same or lower tier on non-lightweight step: hold session model
+                    selected_model = cached_session.model
+                    tier_value = cached_session.tier
+                    route_method = "session-hold"
+                    reasoning = (
+                        f"session-hold ({session_id[:8] if session_id else '?'}...)"
+                        f" {tier_value}>={decision.tier.value}"
+                    )
+                    full_text = f"{system_prompt or ''} {prompt}".strip()
+                    input_toks = estimate_tokens(full_text)
+                    output_budget = estimate_output_budget(prompt, tier_value)
+                    estimated_cost = _estimate_cost(
+                        selected_model, input_toks, min(max_tokens, output_budget),
+                    )
 
                 if session_id:
-                    content_hash = hash_request_content(prompt)
+                    _sessions.touch(session_id)
+
+                # Three-strike escalation (skip for lightweight steps — repeated
+                # tool results are expected, not a signal of model inadequacy)
+                if session_id and not is_lightweight:
+                    content_hash = hash_request_content(prompt, tool_names or None)
                     should_escalate = _sessions.record_request_hash(session_id, content_hash)
                     if should_escalate:
-                        result = _sessions.escalate(session_id, tier_configs_dict)
-                        if result:
-                            selected_model, tier_value = result
-                            reasoning = f"escalated ({tier_value})"
+                        esc = _sessions.escalate(session_id, tier_configs_dict)
+                        if esc:
+                            original_tier = tier_value
+                            selected_model, tier_value = esc
+                            reasoning = f"escalated {original_tier}->{tier_value}"
+                            route_method = "escalated"
+                            esc_feats = extract_features(prompt, system_prompt)
+                            _feedback.learn_from_escalation(
+                                esc_feats, original_tier, tier_value,
+                            )
+                            full_text = f"{system_prompt or ''} {prompt}".strip()
+                            input_toks = estimate_tokens(full_text)
+                            output_budget = estimate_output_budget(prompt, tier_value)
+                            estimated_cost = _estimate_cost(
+                                selected_model, input_toks, min(max_tokens, output_budget),
+                            )
             else:
-                user_keyed = _providers.keyed_models() or None
-                decision = route(prompt, system_prompt, max_tokens, user_keyed_models=user_keyed)
-                selected_model = decision.model
-                tier_value = decision.tier.value
-                reasoning = decision.reasoning
-
                 if session_id:
                     _sessions.set(session_id, selected_model, tier_value)
 
-            check = _spend.check(0.001)
+            check = _spend.check(estimated_cost)
             if not check.allowed:
                 return _spend_error(check)
+
+            request_id = uuid.uuid4().hex[:12]
+            route_feats = extract_features(prompt, system_prompt)
+            _feedback.capture(request_id, route_feats, tier_value)
 
             body["model"] = selected_model
         else:
             selected_model = model
             tier_value = ""
             reasoning = "passthrough"
+
+        route_latency_us = (time.perf_counter_ns() - route_start) / 1000
 
         # BYOK: if user has a key for this model, route to their provider directly
         provider_entry = _providers.get_for_model(selected_model)
@@ -325,12 +543,24 @@ def create_app(
 
         debug_headers: dict[str, str] = {}
         if is_virtual:
+            debug_headers["x-uncommon-route-request-id"] = request_id
             debug_headers["x-uncommon-route-model"] = selected_model
             debug_headers["x-uncommon-route-tier"] = tier_value
+            debug_headers["x-uncommon-route-step"] = step_type
             debug_headers["x-uncommon-route-reasoning"] = reasoning
 
         try:
             if is_streaming:
+                if is_virtual:
+                    _spend.record(estimated_cost, model=selected_model, action="chat")
+                    _stats.record(RouteRecord(
+                        timestamp=time.time(), model=selected_model, tier=tier_value,
+                        confidence=confidence, method=route_method,  # type: ignore[arg-type]
+                        estimated_cost=estimated_cost, savings=savings,
+                        latency_us=route_latency_us, session_id=session_id,
+                        streaming=True,
+                    ))
+
                 async def sse_passthrough() -> AsyncGenerator[bytes, None]:
                     async for chunk in _stream_upstream(target_chat_url, body, fwd_headers):
                         yield chunk
@@ -349,7 +579,21 @@ def create_app(
             resp = await client.post(target_chat_url, json=body, headers=fwd_headers)
 
             if is_virtual:
-                _spend.record(0.001, model=selected_model, action="chat")
+                actual_cost: float | None = None
+                if resp.status_code == 200:
+                    actual_cost = _parse_usage_cost(resp.content, selected_model)
+                _spend.record(
+                    actual_cost if actual_cost is not None else estimated_cost,
+                    model=selected_model,
+                    action="chat",
+                )
+                _stats.record(RouteRecord(
+                    timestamp=time.time(), model=selected_model, tier=tier_value,
+                    confidence=confidence, method=route_method,  # type: ignore[arg-type]
+                    estimated_cost=estimated_cost, actual_cost=actual_cost,
+                    savings=savings, latency_us=route_latency_us,
+                    session_id=session_id, streaming=False,
+                ))
 
             resp_headers = {
                 "content-type": resp.headers.get("content-type", "application/json"),
@@ -361,12 +605,28 @@ def create_app(
                 headers=resp_headers,
             )
         except httpx.ConnectError:
+            if is_virtual:
+                _stats.record(RouteRecord(
+                    timestamp=time.time(), model=selected_model, tier=tier_value,
+                    confidence=confidence, method=route_method,  # type: ignore[arg-type]
+                    estimated_cost=estimated_cost, savings=savings,
+                    latency_us=route_latency_us, session_id=session_id,
+                    streaming=is_streaming,
+                ))
             return JSONResponse(
                 {"error": {"message": f"Upstream unreachable: {upstream_chat}", "type": "proxy_error"}},
                 status_code=502,
                 headers=debug_headers,
             )
         except httpx.TimeoutException:
+            if is_virtual:
+                _stats.record(RouteRecord(
+                    timestamp=time.time(), model=selected_model, tier=tier_value,
+                    confidence=confidence, method=route_method,  # type: ignore[arg-type]
+                    estimated_cost=estimated_cost, savings=savings,
+                    latency_us=route_latency_us, session_id=session_id,
+                    streaming=is_streaming,
+                ))
             return JSONResponse(
                 {"error": {"message": "Upstream request timed out", "type": "proxy_error"}},
                 status_code=504,
@@ -380,6 +640,8 @@ def create_app(
             Route("/v1/chat/completions", handle_chat_completions, methods=["POST"]),
             Route("/v1/spend", handle_spend, methods=["GET", "POST"]),
             Route("/v1/sessions", handle_sessions, methods=["GET"]),
+            Route("/v1/stats", handle_stats, methods=["GET", "POST"]),
+            Route("/v1/feedback", handle_feedback, methods=["GET", "POST"]),
         ],
     )
 
@@ -390,6 +652,7 @@ def serve(
     upstream: str = DEFAULT_UPSTREAM,
     session_store: SessionStore | None = None,
     spend_control: SpendControl | None = None,
+    route_stats: RouteStats | None = None,
 ) -> None:
     """Start the proxy server (blocking)."""
     import uvicorn
@@ -398,6 +661,7 @@ def serve(
         upstream=upstream,
         session_store=session_store,
         spend_control=spend_control,
+        route_stats=route_stats,
     )
     print(f"[UncommonRoute] Proxy listening on http://{host}:{port}")
     print(f"[UncommonRoute] Upstream: {upstream}")

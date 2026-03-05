@@ -6,7 +6,7 @@
 
 <p>
 Route every LLM request to the optimal model.<br>
-39-feature cascade classifier, session persistence, spend control.<br>
+Step-aware agentic routing, 39-feature cascade classifier, session persistence, spend control.<br>
 Pure local — no external API calls for routing decisions.
 </p>
 
@@ -19,7 +19,7 @@ Pure local — no external API calls for routing decisions.
 
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11+-3776ab?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-98_passing-success?style=flat-square)]()
+[![Tests](https://img.shields.io/badge/Tests-169_passing-success?style=flat-square)]()
 [![OpenClaw Plugin](https://img.shields.io/badge/OpenClaw-Plugin-orange?style=flat-square)](https://openclaw.ai)
 
 </div>
@@ -34,7 +34,8 @@ Pure local — no external API calls for routing decisions.
 | [Usage Modes](#usage-modes) | CLI, SDK, Proxy, OpenClaw |
 | [How It Works](#how-it-works) | Cascade classifier architecture |
 | [Routing Tiers](#routing-tiers) | SIMPLE → MEDIUM → COMPLEX → REASONING |
-| [Session Management](#session-management) | Sticky routing, auto-escalation |
+| [Step-Aware Routing](#step-aware-routing) | Per-step model selection for agent workflows |
+| [Session Management](#session-management) | Smart sessions, auto-escalation |
 | [Spend Control](#spend-control) | Per-request, hourly, daily limits |
 | [Models & Pricing](#models--pricing) | Supported models and costs |
 | [Configuration](#configuration) | Environment variables |
@@ -193,18 +194,39 @@ Input Prompt
 
 ---
 
+## Step-Aware Routing
+
+In agentic workflows (OpenClaw, LangChain, etc.), different steps within a single task need different model capabilities. UncommonRoute detects the step type from the request body and routes accordingly:
+
+| Step Type | Detection | Routing Behavior |
+|---|---|---|
+| **Tool-result followup** | Last message `role: "tool"` | Classifier decides freely — allows cheap model for processing tool output |
+| **Tool selection** | `tools` present + last message from user | Normal session logic |
+| **General** | No agentic signals | Normal session logic |
+
+**Before (blind session pin):** Agent session pinned to $25/M model for all 200 requests — including "I read this file" steps.
+
+**After (step-aware):** Tool-result steps automatically use $0.40-2.50/M models. Only steps that need reasoning use expensive models.
+
+The step type is visible in the `x-uncommon-route-step` response header.
+
+---
+
 ## Session Management
 
-Sessions prevent model switching mid-task. When enabled (default):
+Sessions prevent unnecessary model switching mid-task while allowing cost optimization:
 
-- **Sticky routing** — same session ID → same model across requests
+- **Always re-route** — every request gets a fresh classification based on content
+- **Only upgrade, never downgrade** — if the classifier says COMPLEX and the session is MEDIUM, upgrade; if it says SIMPLE, hold the session model
+- **Lightweight exception** — tool-result steps bypass session hold and use the classifier's recommendation directly
 - **30-minute timeout** — sessions auto-expire after inactivity
-- **Three-strike escalation** — 3 identical failed requests → auto-upgrade to next tier
+- **Three-strike escalation** — 3 identical requests → auto-upgrade to next tier (skipped for tool-result steps)
 
 ```python
 # Sessions work via header
 headers = {"X-Session-ID": "my-task-123"}
 
+# OpenClaw's x-openclaw-session-key also supported
 # Or auto-derived from first user message
 ```
 
@@ -315,13 +337,14 @@ cd bench && python run.py
 │   ├── proxy.py              # OpenAI-compatible ASGI proxy
 │   ├── session.py            # Session persistence + escalation
 │   ├── spend_control.py      # Time-windowed spending limits
+│   ├── providers.py          # BYOK provider management
 │   ├── openclaw.py           # OpenClaw config integration
 │   └── cli.py                # CLI entry point
 ├── openclaw-plugin/          # JS bridge for OpenClaw
 │   ├── src/index.js          # Auto-install + lifecycle management
 │   ├── package.json          # @anjieyang/uncommon-route
 │   └── openclaw.plugin.json  # Plugin manifest
-├── tests/                    # 98 tests (unit + integration + E2E)
+├── tests/                    # 169 tests (unit + integration + E2E)
 ├── bench/                    # Benchmarking suite + datasets
 ├── scripts/install.sh        # One-line installer
 └── pyproject.toml            # PyPI-ready packaging
