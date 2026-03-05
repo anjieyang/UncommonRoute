@@ -42,7 +42,7 @@ from uncommon_route.spend_control import SpendControl
 from uncommon_route.providers import ProvidersConfig, load_providers
 
 VERSION = "0.1.0"
-DEFAULT_UPSTREAM = os.environ.get("UNCOMMON_ROUTE_UPSTREAM", "https://openrouter.ai/api/v1")
+DEFAULT_UPSTREAM = os.environ.get("UNCOMMON_ROUTE_UPSTREAM", "https://api.commonstack.ai/v1")
 DEFAULT_PORT = int(os.environ.get("UNCOMMON_ROUTE_PORT", "8403"))
 VIRTUAL_MODEL = "uncommon-route/auto"
 
@@ -312,9 +312,13 @@ def create_app(
             fwd_headers["content-type"] = "application/json"
         fwd_headers["user-agent"] = f"uncommon-route/{VERSION}"
 
-        # BYOK: override auth header with user's API key
+        # Auth: BYOK key takes priority, then request header, then COMMONSTACK_API_KEY env
         if provider_entry:
             fwd_headers["authorization"] = f"Bearer {provider_entry.api_key}"
+        elif "authorization" not in fwd_headers:
+            cs_key = os.environ.get("COMMONSTACK_API_KEY", "")
+            if cs_key:
+                fwd_headers["authorization"] = f"Bearer {cs_key}"
             # Strip provider prefix for direct API calls (e.g. "deepseek/deepseek-chat" → "deepseek-chat")
             raw_model = selected_model.split("/", 1)[-1] if "/" in selected_model else selected_model
             body["model"] = raw_model

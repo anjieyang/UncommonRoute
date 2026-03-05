@@ -36,7 +36,7 @@
     },
     "upstream": {
       "label": "Upstream API URL",
-      "placeholder": "https://openrouter.ai/api/v1"
+      "placeholder": "https://api.commonstack.ai/v1"
     },
     "pythonPath": {
       "label": "Python Path",

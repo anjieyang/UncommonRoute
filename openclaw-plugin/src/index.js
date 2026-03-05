@@ -18,7 +18,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 const VERSION = "0.1.0";
 const DEFAULT_PORT = 8403;
-const DEFAULT_UPSTREAM = "https://openrouter.ai/api/v1";
+const DEFAULT_UPSTREAM = "https://api.commonstack.ai/v1";
 const HEALTH_TIMEOUT_MS = 15_000;
 const HEALTH_POLL_MS = 500;
 const PY_PACKAGE = "uncommon-route";

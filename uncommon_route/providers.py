@@ -35,6 +35,7 @@ _DATA_DIR = Path.home() / ".uncommon-route"
 _PROVIDERS_FILE = _DATA_DIR / "providers.json"
 
 KNOWN_BASE_URLS: dict[str, str] = {
+    "commonstack": "https://api.commonstack.ai/v1",
     "minimax": "https://api.minimax.chat/v1",
     "deepseek": "https://api.deepseek.com/v1",
     "openai": "https://api.openai.com/v1",

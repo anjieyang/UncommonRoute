@@ -252,10 +252,10 @@ Baseline comparison: anthropic/claude-opus-4.6 at $5.00/$25.00 per 1M tokens.
 
 | Variable | Default | Description |
 |---|---|---|
-| `UNCOMMON_ROUTE_UPSTREAM` | `https://openrouter.ai/api/v1` | Upstream API URL |
+| `COMMONSTACK_API_KEY` | — | [Commonstack](https://commonstack.ai) API key (default upstream) |
+| `UNCOMMON_ROUTE_UPSTREAM` | `https://api.commonstack.ai/v1` | Upstream API URL |
 | `UNCOMMON_ROUTE_PORT` | `8403` | Proxy port |
 | `UNCOMMON_ROUTE_DISABLED` | `false` | Disable routing (passthrough) |
-| `ANTHROPIC_API_KEY` | — | For comparison API only |
 
 ### OpenClaw Plugin Config
 
@@ -264,7 +264,7 @@ plugins:
   entries:
     "@anjieyang/uncommon-route":
       port: 8403
-      upstream: "https://openrouter.ai/api/v1"
+      upstream: "https://api.commonstack.ai/v1"
       spendLimits:
         hourly: 5.00
         daily: 20.00
