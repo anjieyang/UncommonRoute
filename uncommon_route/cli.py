@@ -34,7 +34,7 @@ from uncommon_route.router.classifier import classify
 from uncommon_route.router.structural import extract_structural_features, extract_unicode_block_features
 from uncommon_route.router.keywords import extract_keyword_features
 
-VERSION = "0.2.0"
+VERSION = "0.2.2"
 _DATA_DIR = Path.home() / ".uncommon-route"
 _PID_FILE = _DATA_DIR / "serve.pid"
 _LOG_FILE = _DATA_DIR / "serve.log"
@@ -43,21 +43,26 @@ _LOG_FILE = _DATA_DIR / "serve.log"
 def _print_help() -> None:
     print(f"""uncommon-route v{VERSION} — SOTA LLM Router
 
-Usage:
-  uncommon-route route <prompt>         Route a prompt (with interactive feedback)
-  uncommon-route serve                  Start proxy server (OpenAI + Anthropic)
-  uncommon-route setup <client>         Generate config for a client (claude-code)
-  uncommon-route stop                   Stop background proxy instance
-  uncommon-route doctor                 Check configuration & upstream health
-  uncommon-route logs                   Tail background-proxy log
-  uncommon-route debug <prompt>         Show per-dimension scoring breakdown
-  uncommon-route feedback <sub>         Online learning (status|rollback)
-  uncommon-route openclaw <sub>         OpenClaw integration (install|uninstall|status)
-  uncommon-route spend <sub>            Spending limits (status|set|clear|history)
-  uncommon-route provider <sub>         API key management (list|add|remove|models)
-  uncommon-route stats [sub]            Routing analytics (summary|history|reset)
-  uncommon-route sessions               Show active session stats
-  uncommon-route --version              Show version
+Quick start:
+  uncommon-route serve              Start proxy (set UNCOMMON_ROUTE_UPSTREAM first)
+  uncommon-route doctor             Check if everything is configured
+  uncommon-route route "hello"      Test routing locally (no upstream needed)
+
+Commands:
+  route <prompt>                    Route a prompt (with interactive feedback)
+  serve                             Start proxy server (OpenAI + Anthropic)
+  stop                              Stop background proxy instance
+  doctor                            Check configuration & upstream health
+  logs                              Tail background-proxy log
+  setup <client>                    Generate config for a client (claude-code)
+  debug <prompt>                    Show per-dimension scoring breakdown
+  feedback <sub>                    Online learning (status|rollback)
+  openclaw <sub>                    OpenClaw integration (install|uninstall|status)
+  spend <sub>                       Spending limits (status|set|clear|history)
+  provider <sub>                    API key management (list|add|remove|models)
+  stats [sub]                       Routing analytics (summary|history|reset)
+  sessions                          Show active session stats
+  --version                         Show version
 
 Route options:
   --system-prompt <text>              System prompt for context

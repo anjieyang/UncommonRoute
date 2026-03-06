@@ -179,6 +179,37 @@ def select_preferred_model(
     return None, None
 
 
+def verify_key(base_url: str, api_key: str) -> tuple[bool, str]:
+    """Ping ``/v1/models`` to check if an API key is valid.
+
+    Returns ``(ok, detail)`` — *detail* is a human-readable status string.
+    """
+    import httpx
+
+    url = f"{base_url.rstrip('/')}/models"
+    try:
+        resp = httpx.get(
+            url,
+            headers={"authorization": f"Bearer {api_key}"},
+            timeout=httpx.Timeout(8.0, connect=4.0),
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            count = len(data.get("data", []))
+            return True, f"{count} models available"
+        if resp.status_code == 401:
+            return False, "invalid or expired API key (HTTP 401)"
+        if resp.status_code == 403:
+            return False, "access denied (HTTP 403)"
+        return False, f"unexpected HTTP {resp.status_code}"
+    except httpx.ConnectError:
+        return False, f"cannot connect to {url}"
+    except httpx.TimeoutException:
+        return False, f"timeout connecting to {url}"
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+
+
 def cmd_provider(args: list[str]) -> None:
     """Handle `uncommon-route provider <subcommand>`."""
     if not args:
@@ -225,6 +256,15 @@ def cmd_provider(args: list[str]) -> None:
         print(f"  Added provider: {name}")
         if models:
             print(f"  Models: {', '.join(models)}")
+
+        resolved_url = base_url or KNOWN_BASE_URLS.get(name, "")
+        if resolved_url:
+            ok, detail = verify_key(resolved_url, api_key)
+            if ok:
+                print(f"  Key verified: {detail}")
+            else:
+                print(f"  Warning: key verification failed — {detail}")
+                print(f"  The key was saved but may not work. Check with: uncommon-route doctor")
         print(f"  These models will be prioritized when routing to their tier")
 
     elif sub == "remove":

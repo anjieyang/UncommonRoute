@@ -56,7 +56,7 @@ from uncommon_route.anthropic_compat import (
     OpenAIToAnthropicStreamConverter,
 )
 
-VERSION = "0.2.0"
+VERSION = "0.2.2"
 DEFAULT_UPSTREAM = os.environ.get("UNCOMMON_ROUTE_UPSTREAM", "")
 DEFAULT_PORT = int(os.environ.get("UNCOMMON_ROUTE_PORT", "8403"))
 VIRTUAL_MODEL = "uncommon-route/auto"
@@ -884,21 +884,36 @@ def serve(
         spend_control=spend_control,
         route_stats=route_stats,
     )
-    print(f"[UncommonRoute] Proxy listening on http://{host}:{port}")
-    if upstream:
-        print(f"[UncommonRoute] Upstream: {upstream}")
-    else:
-        print(f"[UncommonRoute] WARNING: No upstream configured — requests will return 503")
-        print(f"[UncommonRoute] Set UNCOMMON_ROUTE_UPSTREAM and UNCOMMON_ROUTE_API_KEY to enable forwarding")
-    print(f"[UncommonRoute] Virtual model: {VIRTUAL_MODEL}")
-    print(f"[UncommonRoute] Endpoints: /v1/chat/completions (OpenAI) + /v1/messages (Anthropic)")
-    print(f"[UncommonRoute] Session persistence: enabled")
-    print(f"[UncommonRoute] Spend control: enabled")
+    base = f"http://{host}:{port}"
+    bar = "─" * 45
+
+    has_dashboard = False
     try:
         import importlib.resources as _pr
-        _sd = _pr.files("uncommon_route") / "static" / "index.html"
-        if _sd.is_file():
-            print(f"[UncommonRoute] Dashboard: http://{host}:{port}/dashboard/")
+        has_dashboard = (_pr.files("uncommon_route") / "static" / "index.html").is_file()
     except Exception:  # noqa: BLE001
         pass
+
+    print()
+    print(f"  UncommonRoute v{VERSION}")
+    print(f"  {bar}")
+    if upstream:
+        short = upstream.replace("https://", "").replace("http://", "").rstrip("/v1").rstrip("/")
+        print(f"  Upstream:    {short}")
+        print(f"  Proxy:       {base}")
+        if has_dashboard:
+            print(f"  Dashboard:   {base}/dashboard/")
+        print()
+        print(f"  Quick test:")
+        print(f"    curl {base}/health")
+    else:
+        print(f"  Upstream:    (not configured)")
+        print()
+        print(f"  Get started:")
+        print(f'    export UNCOMMON_ROUTE_UPSTREAM="https://api.commonstack.ai/v1"')
+        print(f'    export UNCOMMON_ROUTE_API_KEY="your-key"')
+        print(f"    uncommon-route serve")
+    print(f"  {bar}")
+    print(flush=True)
+
     uvicorn.run(app, host=host, port=port, log_level="info")

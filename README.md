@@ -236,6 +236,8 @@ http://127.0.0.1:8403/dashboard/
 | **Sessions** | Active sessions with model, tier, request count, age |
 | **Spend** | Current limits, set/clear limits, spending history |
 
+The dashboard handles edge cases gracefully: a loading spinner while connecting, a guided setup card when no requests have been made yet, and clear error states when the proxy is unreachable or the upstream is not configured.
+
 Data auto-refreshes every 5 seconds. Built with React + [Tremor](https://tremor.so) + Tailwind CSS.
 
 ---
@@ -371,13 +373,26 @@ Data persists at `~/.uncommon-route/spending.json`.
 
 ## Diagnostics
 
+### Startup Banner
+
+`uncommon-route serve` shows a structured banner with upstream, proxy URL, and dashboard link. If no upstream is configured, it prints the exact setup commands instead.
+
+### Real-Time Routing Log
+
+Every routed request prints a one-line summary to the proxy terminal:
+
+```
+[route] SIMPLE → moonshot/kimi-k2.5  $0.0003  (356µs  cascade  session:a3f2c1b8)
+[route] COMPLEX → google/gemini-3.1-pro  $0.0142  (412µs  cascade  stream  [anthropic])
+```
+
 ### Health Check
 
 ```bash
 uncommon-route doctor
 ```
 
-Checks Python version, upstream connectivity, API key validity, model discovery, BYOK provider status, and daemon state. Run this first when something isn't working.
+Checks Python version, upstream connectivity, API key validity, model discovery, BYOK provider status, Claude Code integration, and daemon state. Run this first when something isn't working.
 
 ### Background Mode
 
