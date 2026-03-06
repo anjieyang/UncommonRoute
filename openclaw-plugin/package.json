@@ -1,6 +1,6 @@
 {
   "name": "@anjieyang/uncommon-route",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "OpenClaw plugin — UncommonRoute smart LLM router, 98% accuracy, OpenAI + Anthropic compatible",
   "type": "module",
   "main": "src/index.js",
@@ -12,7 +12,8 @@
   "files": [
     "src/",
     "openclaw.plugin.json",
-    "openclaw.security.json"
+    "openclaw.security.json",
+    "README.md"
   ],
   "keywords": [
     "openclaw",
