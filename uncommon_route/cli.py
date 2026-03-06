@@ -3,7 +3,10 @@
 Subcommands:
     route    — classify a prompt and print the routing decision (with interactive feedback)
     serve    — start the OpenAI-compatible proxy server
+    stop     — stop a background proxy instance
     debug    — show per-dimension scoring breakdown
+    doctor   — check configuration and upstream health
+    logs     — tail the background-proxy log file
     feedback — manage online learning (status/rollback)
     openclaw — manage OpenClaw integration (install/uninstall/status)
     spend    — manage spending limits (set/clear/status/history)
@@ -19,15 +22,22 @@ Global flags:
 from __future__ import annotations
 
 import json
+import os
+import signal
+import subprocess
 import sys
 import time
+from pathlib import Path
 
 from uncommon_route.router.api import route
 from uncommon_route.router.classifier import classify
 from uncommon_route.router.structural import extract_structural_features, extract_unicode_block_features
 from uncommon_route.router.keywords import extract_keyword_features
 
-VERSION = "0.1.2"
+VERSION = "0.2.0"
+_DATA_DIR = Path.home() / ".uncommon-route"
+_PID_FILE = _DATA_DIR / "serve.pid"
+_LOG_FILE = _DATA_DIR / "serve.log"
 
 
 def _print_help() -> None:
@@ -35,12 +45,16 @@ def _print_help() -> None:
 
 Usage:
   uncommon-route route <prompt>         Route a prompt (with interactive feedback)
-  uncommon-route serve                  Start OpenAI-compatible proxy server
+  uncommon-route serve                  Start proxy server (OpenAI + Anthropic)
+  uncommon-route setup <client>         Generate config for a client (claude-code)
+  uncommon-route stop                   Stop background proxy instance
+  uncommon-route doctor                 Check configuration & upstream health
+  uncommon-route logs                   Tail background-proxy log
   uncommon-route debug <prompt>         Show per-dimension scoring breakdown
   uncommon-route feedback <sub>         Online learning (status|rollback)
   uncommon-route openclaw <sub>         OpenClaw integration (install|uninstall|status)
   uncommon-route spend <sub>            Spending limits (status|set|clear|history)
-  uncommon-route provider <sub>          API key management (list|add|remove|models)
+  uncommon-route provider <sub>         API key management (list|add|remove|models)
   uncommon-route stats [sub]            Routing analytics (summary|history|reset)
   uncommon-route sessions               Show active session stats
   uncommon-route --version              Show version
@@ -51,14 +65,19 @@ Route options:
   --json                              Output as JSON
   --no-feedback                       Skip interactive feedback prompt
 
-Feedback subcommands:
-  feedback status                     Show online learning status
-  feedback rollback                   Discard online weights, revert to base model
-
 Serve options:
   --port <n>                          Port to listen on (default: 8403)
   --host <addr>                       Host to bind (default: 127.0.0.1)
   --upstream <url>                    Upstream API base URL
+  --daemon                            Run in background (logs to ~/.uncommon-route/serve.log)
+
+Logs options:
+  --limit <n>                         Number of lines to show (default: 50)
+  --follow                            Stream new lines (like tail -f)
+
+Feedback subcommands:
+  feedback status                     Show online learning status
+  feedback rollback                   Discard online weights, revert to base model
 
 OpenClaw subcommands:
   openclaw install [--port <n>]       Register as OpenClaw provider
@@ -66,10 +85,10 @@ OpenClaw subcommands:
   openclaw status                     Check registration
 
 Provider subcommands:
-  provider list                         Show configured API keys
-  provider add <name> <key>             Add key (e.g. deepseek, minimax, openai)
-  provider remove <name>                Remove a key
-  provider models                       List user-keyed models
+  provider list                       Show configured API keys
+  provider add <name> <key>           Add key (e.g. deepseek, minimax, openai)
+  provider remove <name>              Remove a key
+  provider models                     List user-keyed models
 
 Spend subcommands:
   spend status                        Show spending status & limits
@@ -83,14 +102,20 @@ Stats subcommands:
   stats history [--limit <n>]         Recent routing decisions
   stats reset                         Clear all stats
 
+Setup subcommands:
+  setup claude-code [--port <n>]      Generate Claude Code environment config
+  setup codex [--port <n>]            Generate OpenAI Codex environment config
+  setup openai [--port <n>]           Generate OpenAI SDK / Cursor config
+
 Examples:
   uncommon-route route "what is 2+2"
   uncommon-route serve --port 8403
-  uncommon-route openclaw install
+  uncommon-route serve --daemon
+  uncommon-route setup claude-code
+  uncommon-route doctor
+  uncommon-route logs --follow
   uncommon-route spend set hourly 5.00
-  uncommon-route spend status
   uncommon-route provider add deepseek sk-...
-  uncommon-route provider add minimax eyJ... --plan coding-plan
 """)
 
 
@@ -260,15 +285,194 @@ def _cmd_serve(args: list[str]) -> None:
         "port": True,
         "host": True,
         "upstream": True,
+        "daemon": False,
+        "background": False,
     })
 
-    from uncommon_route.proxy import DEFAULT_PORT, DEFAULT_UPSTREAM, serve
+    from uncommon_route.proxy import DEFAULT_PORT, DEFAULT_UPSTREAM
 
     port = int(flags.get("port", DEFAULT_PORT))
     host = str(flags.get("host", "127.0.0.1"))
     upstream = str(flags.get("upstream", DEFAULT_UPSTREAM))
+    daemon = bool(flags.get("daemon") or flags.get("background"))
 
+    if daemon:
+        _DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if _PID_FILE.exists():
+            old_pid = int(_PID_FILE.read_text().strip())
+            try:
+                os.kill(old_pid, 0)
+                print(f"  Already running (PID {old_pid}). Stop first: uncommon-route stop")
+                return
+            except OSError:
+                _PID_FILE.unlink(missing_ok=True)
+
+        cmd = [sys.executable, "-m", "uncommon_route.cli", "serve",
+               "--port", str(port), "--host", host]
+        if upstream:
+            cmd.extend(["--upstream", upstream])
+
+        with open(_LOG_FILE, "a") as lf:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        _PID_FILE.write_text(str(proc.pid))
+        print(f"  Started in background (PID {proc.pid})")
+        print(f"  Logs:  {_LOG_FILE}")
+        print(f"  Stop:  uncommon-route stop")
+        return
+
+    from uncommon_route.proxy import serve
     serve(port=port, host=host, upstream=upstream)
+
+
+def _cmd_stop(args: list[str]) -> None:
+    if not _PID_FILE.exists():
+        print("  No running instance found")
+        return
+    try:
+        pid = int(_PID_FILE.read_text().strip())
+    except ValueError:
+        _PID_FILE.unlink(missing_ok=True)
+        print("  Corrupt PID file removed")
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print(f"  Stopped (PID {pid})")
+    except ProcessLookupError:
+        print(f"  Process {pid} not found (already stopped)")
+    _PID_FILE.unlink(missing_ok=True)
+
+
+def _cmd_doctor(args: list[str]) -> None:
+    import asyncio
+
+    checks: list[tuple[str, bool, str]] = []
+
+    # Python version
+    vi = sys.version_info
+    ok = vi >= (3, 11)
+    checks.append(("Python version", ok, f"{vi.major}.{vi.minor}.{vi.micro}"))
+
+    # Upstream configured
+    upstream = os.environ.get("UNCOMMON_ROUTE_UPSTREAM", "")
+    checks.append(("Upstream configured", bool(upstream), upstream or "(not set)"))
+
+    # API key configured
+    api_key = (
+        os.environ.get("UNCOMMON_ROUTE_API_KEY", "")
+        or os.environ.get("COMMONSTACK_API_KEY", "")
+    )
+    key_preview = f"{api_key[:8]}..." if len(api_key) > 8 else ("(set)" if api_key else "(not set)")
+    checks.append(("API key configured", bool(api_key), key_preview))
+
+    # Upstream reachable + model discovery
+    if upstream and api_key:
+        from uncommon_route.model_map import ModelMapper
+        mapper = ModelMapper(upstream)
+        gw_tag = " (gateway)" if mapper.is_gateway else ""
+        count = asyncio.run(mapper.discover(api_key or None))
+        checks.append(("Upstream reachable", count > 0, f"{mapper.provider}{gw_tag}"))
+        checks.append(("Models discovered", count > 0, f"{count} models"))
+        if mapper.discovered:
+            unresolved = mapper.unresolved_models()
+            if unresolved:
+                names = ", ".join(unresolved[:3])
+                extra = f" (+{len(unresolved) - 3} more)" if len(unresolved) > 3 else ""
+                checks.append(("Model mapping", False, f"{len(unresolved)} unresolved: {names}{extra}"))
+            else:
+                checks.append(("Model mapping", True, "all internal models resolved"))
+        else:
+            checks.append(("Model mapping", False, "cannot verify (discovery failed)"))
+    elif upstream:
+        checks.append(("Upstream reachable", False, "cannot test without API key"))
+
+    # BYOK providers
+    from uncommon_route.providers import load_providers
+    providers = load_providers()
+    if providers.providers:
+        for name, entry in providers.providers.items():
+            reachable = asyncio.run(_check_provider(entry.base_url, entry.api_key))
+            checks.append((f"BYOK: {name}", reachable, entry.base_url))
+    else:
+        checks.append(("BYOK providers", True, "none configured (optional)"))
+
+    # Claude Code integration
+    anth_base = os.environ.get("ANTHROPIC_BASE_URL", "")
+    if anth_base:
+        checks.append(("Claude Code", True, f"ANTHROPIC_BASE_URL={anth_base}"))
+    else:
+        checks.append(("Claude Code", True, "not configured (optional — run: uncommon-route setup claude-code)"))
+
+    # Daemon status
+    if _PID_FILE.exists():
+        pid = int(_PID_FILE.read_text().strip())
+        try:
+            os.kill(pid, 0)
+            checks.append(("Proxy daemon", True, f"running (PID {pid})"))
+        except OSError:
+            checks.append(("Proxy daemon", False, f"stale PID file (PID {pid})"))
+    else:
+        checks.append(("Proxy daemon", True, "not running (foreground or stopped)"))
+
+    # Output
+    all_ok = all(ok for _, ok, _ in checks)
+    print()
+    for label, ok, detail in checks:
+        icon = "✓" if ok else "✗"
+        print(f"  {icon} {label}: {detail}")
+    print()
+    if all_ok:
+        print("  All checks passed")
+    else:
+        print("  Some checks failed — see above")
+
+
+async def _check_provider(base_url: str, api_key: str) -> bool:
+    """Lightweight connectivity check for a provider endpoint."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=3.0)) as client:
+            resp = await client.get(
+                f"{base_url.rstrip('/')}/models",
+                headers={"authorization": f"Bearer {api_key}"},
+            )
+            return resp.status_code == 200
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _cmd_logs(args: list[str]) -> None:
+    flags, _ = _parse_flags(args, {"limit": True, "follow": False})
+    limit = int(flags.get("limit", 50))
+    follow = bool(flags.get("follow"))
+
+    if not _LOG_FILE.exists():
+        print("  No log file found")
+        print("  Start the proxy in background: uncommon-route serve --daemon")
+        return
+
+    if follow:
+        print(f"  Tailing {_LOG_FILE}  (Ctrl+C to stop)")
+        try:
+            with open(_LOG_FILE) as f:
+                f.seek(0, 2)
+                while True:
+                    line = f.readline()
+                    if line:
+                        print(line, end="")
+                    else:
+                        time.sleep(0.3)
+        except KeyboardInterrupt:
+            pass
+        return
+
+    lines = _LOG_FILE.read_text().splitlines()
+    for line in lines[-limit:]:
+        print(line)
 
 
 def _cmd_openclaw(args: list[str]) -> None:
@@ -460,6 +664,171 @@ def _cmd_feedback(args: list[str]) -> None:
         sys.exit(1)
 
 
+def _cmd_setup(args: list[str]) -> None:
+    if not args:
+        print("Usage: uncommon-route setup <client>", file=sys.stderr)
+        print("  Available clients: claude-code, codex, openai", file=sys.stderr)
+        sys.exit(1)
+
+    sub = args[0]
+    handlers = {
+        "claude-code": _setup_claude_code,
+        "openai": _setup_openai,
+        "codex": _setup_codex,
+    }
+    handler = handlers.get(sub)
+    if handler:
+        handler(args[1:])
+    else:
+        print(f"Unknown client: {sub}", file=sys.stderr)
+        print(f"  Available: {', '.join(handlers)}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _detect_rc_file() -> str:
+    shell = os.environ.get("SHELL", "")
+    if "zsh" in shell:
+        return "~/.zshrc"
+    if "fish" in shell:
+        return "~/.config/fish/config.fish"
+    return "~/.bashrc"
+
+
+def _setup_env_display() -> tuple[str, str, str]:
+    """Return (upstream_val, key_display, status_msg) from current env."""
+    upstream = os.environ.get("UNCOMMON_ROUTE_UPSTREAM", "")
+    api_key = os.environ.get("UNCOMMON_ROUTE_API_KEY", "")
+    upstream_val = upstream or "https://openrouter.ai/api/v1"
+    key_display = f"{api_key[:12]}..." if len(api_key) > 12 else (api_key or "sk-or-your-key-here")
+    if upstream and api_key:
+        status = "upstream and key already configured — ready to go."
+    elif upstream:
+        status = "upstream set, but UNCOMMON_ROUTE_API_KEY is missing."
+    else:
+        status = "UNCOMMON_ROUTE_UPSTREAM and UNCOMMON_ROUTE_API_KEY need to be set."
+    return upstream_val, key_display, status
+
+
+def _setup_claude_code(args: list[str]) -> None:
+    from uncommon_route.proxy import DEFAULT_PORT
+
+    flags, _ = _parse_flags(args, {"port": True})
+    port = int(flags.get("port", DEFAULT_PORT))
+    rc = _detect_rc_file()
+    upstream_val, key_display, status = _setup_env_display()
+
+    print(f"""
+  UncommonRoute + Claude Code
+  {'=' * 40}
+
+  Add to {rc}:
+
+    # --- UncommonRoute proxy ---
+    export UNCOMMON_ROUTE_UPSTREAM="{upstream_val}"
+    export UNCOMMON_ROUTE_API_KEY="{key_display}"
+
+    # --- Claude Code → UncommonRoute ---
+    export ANTHROPIC_BASE_URL="http://localhost:{port}"
+    export ANTHROPIC_API_KEY="not-needed"
+
+  Then:
+
+    1. source {rc}
+    2. uncommon-route serve          (terminal 1)
+    3. claude                        (terminal 2)
+
+  How it works:
+
+    Claude Code  --POST /v1/messages-->  UncommonRoute  --best model-->  Upstream API
+                                         (smart routing)
+
+    - Auth is managed by the proxy. Claude Code does not need a real API key.
+    - All requests are smart-routed to the best model automatically.
+    - Responses are converted back to Anthropic format transparently.
+""")
+    print(f"  Status: {status}")
+
+
+def _setup_codex(args: list[str]) -> None:
+    from uncommon_route.proxy import DEFAULT_PORT
+
+    flags, _ = _parse_flags(args, {"port": True})
+    port = int(flags.get("port", DEFAULT_PORT))
+    rc = _detect_rc_file()
+    upstream_val, key_display, status = _setup_env_display()
+
+    print(f"""
+  UncommonRoute + OpenAI Codex
+  {'=' * 40}
+
+  Add to {rc}:
+
+    # --- UncommonRoute proxy ---
+    export UNCOMMON_ROUTE_UPSTREAM="{upstream_val}"
+    export UNCOMMON_ROUTE_API_KEY="{key_display}"
+
+    # --- Codex → UncommonRoute ---
+    export OPENAI_BASE_URL="http://localhost:{port}/v1"
+    export OPENAI_API_KEY="not-needed"
+
+  Then:
+
+    1. source {rc}
+    2. uncommon-route serve          (terminal 1)
+    3. codex                         (terminal 2)
+
+  How it works:
+
+    Codex  --POST /v1/chat/completions-->  UncommonRoute  --best model-->  Upstream API
+                                           (smart routing)
+
+    - Set model to "uncommon-route/auto" for smart routing.
+    - Auth is managed by the proxy. Codex does not need a real API key.
+    - Non-virtual model names are passed through unchanged.
+""")
+    print(f"  Status: {status}")
+
+
+def _setup_openai(args: list[str]) -> None:
+    from uncommon_route.proxy import DEFAULT_PORT
+
+    flags, _ = _parse_flags(args, {"port": True})
+    port = int(flags.get("port", DEFAULT_PORT))
+    rc = _detect_rc_file()
+    upstream_val, key_display, status = _setup_env_display()
+
+    print(f"""
+  UncommonRoute + OpenAI SDK / Cursor
+  {'=' * 40}
+
+  Add to {rc}:
+
+    # --- UncommonRoute proxy ---
+    export UNCOMMON_ROUTE_UPSTREAM="{upstream_val}"
+    export UNCOMMON_ROUTE_API_KEY="{key_display}"
+
+  Then:
+
+    1. source {rc}
+    2. uncommon-route serve
+
+  Python usage:
+
+    from openai import OpenAI
+    client = OpenAI(
+        base_url="http://localhost:{port}/v1",
+        api_key="not-needed",
+    )
+    client.chat.completions.create(
+        model="uncommon-route/auto",   # smart routing
+        messages=[{{"role": "user", "content": "hello"}}],
+    )
+
+  Cursor: set "OpenAI Base URL" to http://localhost:{port}/v1 in settings.
+""")
+    print(f"  Status: {status}")
+
+
 def _cmd_sessions(args: list[str]) -> None:
     from uncommon_route.session import SessionStore
     store = SessionStore()
@@ -489,6 +858,10 @@ def main() -> None:
     commands = {
         "route": _cmd_route,
         "serve": _cmd_serve,
+        "setup": _cmd_setup,
+        "stop": _cmd_stop,
+        "doctor": _cmd_doctor,
+        "logs": _cmd_logs,
         "debug": _cmd_debug,
         "openclaw": _cmd_openclaw,
         "spend": _cmd_spend,

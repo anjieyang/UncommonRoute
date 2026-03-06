@@ -23,11 +23,15 @@ import time
 import uuid
 from typing import Any, AsyncGenerator
 
+from collections.abc import AsyncGenerator as _LifespanGen
+from contextlib import asynccontextmanager
+
 import httpx
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
-from starlette.routing import Route
+from starlette.routing import Mount, Route
+from starlette.staticfiles import StaticFiles
 
 from uncommon_route.router.api import route
 from uncommon_route.router.classifier import classify, extract_features
@@ -44,8 +48,15 @@ from uncommon_route.spend_control import SpendControl
 from uncommon_route.stats import RouteRecord, RouteStats
 from uncommon_route.feedback import FeedbackCollector
 from uncommon_route.providers import ProvidersConfig, load_providers
+from uncommon_route.model_map import ModelMapper
+from uncommon_route.anthropic_compat import (
+    anthropic_to_openai_request,
+    openai_to_anthropic_response,
+    anthropic_error_response,
+    OpenAIToAnthropicStreamConverter,
+)
 
-VERSION = "0.1.2"
+VERSION = "0.2.0"
 DEFAULT_UPSTREAM = os.environ.get("UNCOMMON_ROUTE_UPSTREAM", "")
 DEFAULT_PORT = int(os.environ.get("UNCOMMON_ROUTE_PORT", "8403"))
 VIRTUAL_MODEL = "uncommon-route/auto"
@@ -259,8 +270,25 @@ def _classify_step(body: dict) -> tuple[str, list[str]]:
     return "general", tool_names
 
 
-def _spend_error(result: Any) -> JSONResponse:
+_MODEL_ERROR_PATTERNS = ("model", "not found", "not available", "does not exist", "unsupported", "invalid model")
+
+
+def _is_model_error(content: bytes) -> bool:
+    """Heuristic: does the upstream error body indicate a model-level problem?"""
+    try:
+        text = content.decode("utf-8", errors="replace").lower()
+        return any(p in text for p in _MODEL_ERROR_PATTERNS)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _spend_error(result: Any, *, api_format: str = "openai") -> JSONResponse:
     """Build a 429 error response for spend control violations."""
+    if api_format == "anthropic":
+        return JSONResponse(
+            anthropic_error_response(429, result.reason or "Spending limit exceeded"),
+            status_code=429,
+        )
     body: dict[str, Any] = {
         "error": {
             "message": result.reason or "Spending limit exceeded",
@@ -280,6 +308,7 @@ def create_app(
     providers_config: ProvidersConfig | None = None,
     route_stats: RouteStats | None = None,
     feedback: FeedbackCollector | None = None,
+    model_mapper: ModelMapper | None = None,
 ) -> Starlette:
     """Create the ASGI application wired to the given upstream base URL.
 
@@ -290,12 +319,14 @@ def create_app(
         providers_config: Optional BYOK provider config for user-keyed models.
         route_stats: Optional RouteStats for per-request analytics.
         feedback: Optional FeedbackCollector for online learning.
+        model_mapper: Optional ModelMapper for upstream model name translation.
     """
     _sessions = session_store or SessionStore()
     _spend = spend_control or SpendControl()
     _providers = providers_config or load_providers()
     _stats = route_stats or RouteStats()
     _feedback = feedback or FeedbackCollector()
+    _mapper = model_mapper or ModelMapper(upstream)
 
     upstream_chat = f"{upstream.rstrip('/')}/chat/completions"
 
@@ -303,6 +334,25 @@ def create_app(
         tier.value: {"primary": tc.primary, "fallback": tc.fallback}
         for tier, tc in DEFAULT_CONFIG.tiers.items()
     }
+
+    async def _on_startup() -> None:
+        if not upstream:
+            return
+        api_key = (
+            os.environ.get("UNCOMMON_ROUTE_API_KEY", "")
+            or os.environ.get("COMMONSTACK_API_KEY", "")
+        ) or None
+        count = await _mapper.discover(api_key)
+        if count > 0:
+            gw_tag = " (gateway)" if _mapper.is_gateway else ""
+            print(f"[UncommonRoute] Discovered {count} models from {_mapper.provider}{gw_tag}")
+            unresolved = _mapper.unresolved_models()
+            if unresolved:
+                names = ", ".join(unresolved[:5])
+                extra = f" (+{len(unresolved) - 5} more)" if len(unresolved) > 5 else ""
+                print(f"[UncommonRoute] Warning: {len(unresolved)} internal model(s) not found upstream: {names}{extra}")
+        elif _mapper.provider != "unknown":
+            print(f"[UncommonRoute] Warning: could not discover models from {_mapper.provider} — using static aliases")
 
     async def handle_health(request: Request) -> JSONResponse:
         spend_status = _spend.status()
@@ -331,10 +381,35 @@ def create_app(
                 "total_updates": _feedback.total_updates,
                 "online_model": _feedback.online_model_active,
             },
+            "model_mapper": {
+                "provider": _mapper.provider,
+                "is_gateway": _mapper.is_gateway,
+                "discovered": _mapper.discovered,
+                "upstream_models": _mapper.upstream_model_count,
+                "unresolved": _mapper.unresolved_models(),
+            },
         })
 
     async def handle_models(request: Request) -> JSONResponse:
         return JSONResponse({"object": "list", "data": VIRTUAL_MODELS})
+
+    async def handle_models_mapping(request: Request) -> JSONResponse:
+        return JSONResponse({
+            "provider": _mapper.provider,
+            "is_gateway": _mapper.is_gateway,
+            "discovered": _mapper.discovered,
+            "upstream_model_count": _mapper.upstream_model_count,
+            "mappings": _mapper.mapping_table(),
+            "unresolved": _mapper.unresolved_models(),
+        })
+
+    _dashboard_mount = None
+    try:
+        import importlib.resources as _pkg
+        _static_dir = str(_pkg.files("uncommon_route") / "static")
+        _dashboard_mount = StaticFiles(directory=_static_dir, html=True)
+    except Exception:  # noqa: BLE001
+        pass
 
     async def handle_spend(request: Request) -> JSONResponse:
         """GET /v1/spend — current spend status. POST /v1/spend — set limits."""
@@ -424,14 +499,21 @@ def create_app(
             "total_updates": _feedback.total_updates,
         }, status_code=200 if result.ok else 404)
 
-    async def handle_chat_completions(request: Request) -> Response:
+    async def _handle_chat_core(
+        body: dict,
+        request: Request,
+        *,
+        api_format: str = "openai",
+    ) -> Response:
         if not upstream:
+            msg = _SETUP_GUIDE.strip()
+            if api_format == "anthropic":
+                return JSONResponse(anthropic_error_response(503, msg), status_code=503)
             return JSONResponse(
-                {"error": {"message": _SETUP_GUIDE.strip(), "type": "configuration_error"}},
+                {"error": {"message": msg, "type": "configuration_error"}},
                 status_code=503,
             )
 
-        body = await request.json()
         model = (body.get("model") or "").strip().lower()
         is_streaming = body.get("stream", False)
 
@@ -443,6 +525,7 @@ def create_app(
         estimated_cost = 0.0
         session_id: str | None = None
         request_id = ""
+        fallback_models: list[str] = []
 
         if is_virtual:
             prompt, system_prompt, max_tokens = _extract_prompt(body)
@@ -450,6 +533,8 @@ def create_app(
             if prompt.startswith("/debug"):
                 debug_prompt = prompt[len("/debug"):].strip() or "hello"
                 debug_body = _build_debug_response(debug_prompt, system_prompt)
+                if api_format == "anthropic":
+                    return JSONResponse(openai_to_anthropic_response(debug_body, "uncommon-route/debug"))
                 return JSONResponse(debug_body)
 
             session_id = _resolve_session(request, body, _sessions)
@@ -529,13 +614,17 @@ def create_app(
 
             check = _spend.check(estimated_cost)
             if not check.allowed:
-                return _spend_error(check)
+                return _spend_error(check, api_format=api_format)
 
             request_id = uuid.uuid4().hex[:12]
             route_feats = extract_features(prompt, system_prompt)
             _feedback.capture(request_id, route_feats, tier_value)
 
             body["model"] = selected_model
+            fallback_models = [
+                fb.model for fb in decision.fallback_chain
+                if fb.model != selected_model
+            ]
         else:
             selected_model = model
             tier_value = ""
@@ -555,22 +644,28 @@ def create_app(
             val = request.headers.get(key)
             if val:
                 fwd_headers[key] = val
+        if api_format == "anthropic" and "authorization" not in fwd_headers:
+            x_api_key = request.headers.get("x-api-key")
+            if x_api_key:
+                fwd_headers["authorization"] = f"Bearer {x_api_key}"
         if "content-type" not in fwd_headers:
             fwd_headers["content-type"] = "application/json"
         fwd_headers["user-agent"] = f"uncommon-route/{VERSION}"
 
-        # Auth: BYOK key > request header > UNCOMMON_ROUTE_API_KEY > COMMONSTACK_API_KEY (legacy)
+        # Resolve model name for the target upstream
+        if not provider_entry:
+            body["model"] = _mapper.resolve(selected_model)
+
+        # Auth: BYOK key > env key > request header
         if provider_entry:
             fwd_headers["authorization"] = f"Bearer {provider_entry.api_key}"
-        elif "authorization" not in fwd_headers:
-            api_key = (
+        else:
+            env_key = (
                 os.environ.get("UNCOMMON_ROUTE_API_KEY", "")
                 or os.environ.get("COMMONSTACK_API_KEY", "")
             )
-            if api_key:
-                fwd_headers["authorization"] = f"Bearer {api_key}"
-            raw_model = selected_model.split("/", 1)[-1] if "/" in selected_model else selected_model
-            body["model"] = raw_model
+            if env_key:
+                fwd_headers["authorization"] = f"Bearer {env_key}"
 
         debug_headers: dict[str, str] = {}
         if is_virtual:
@@ -592,6 +687,26 @@ def create_app(
                         streaming=True,
                     ))
 
+                if api_format == "anthropic":
+                    converter = OpenAIToAnthropicStreamConverter(model=selected_model)
+
+                    async def anthropic_sse() -> AsyncGenerator[bytes, None]:
+                        async for chunk in _stream_upstream(target_chat_url, body, fwd_headers):
+                            for ev in converter.feed(chunk):
+                                yield ev
+                        for ev in converter.finish():
+                            yield ev
+
+                    return StreamingResponse(
+                        anthropic_sse(),
+                        media_type="text/event-stream",
+                        headers={
+                            "cache-control": "no-cache",
+                            "connection": "keep-alive",
+                            **debug_headers,
+                        },
+                    )
+
                 async def sse_passthrough() -> AsyncGenerator[bytes, None]:
                     async for chunk in _stream_upstream(target_chat_url, body, fwd_headers):
                         yield chunk
@@ -609,6 +724,28 @@ def create_app(
             client = _get_client()
             resp = await client.post(target_chat_url, json=body, headers=fwd_headers)
 
+            # Fallback: if upstream rejects the model, try alternatives
+            if (
+                is_virtual
+                and resp.status_code in (400, 404, 422)
+                and fallback_models
+                and not provider_entry
+                and _is_model_error(resp.content)
+            ):
+                original_model = body["model"]
+                for fb_model in fallback_models:
+                    fb_resolved = _mapper.resolve(fb_model)
+                    body["model"] = fb_resolved
+                    retry = await client.post(target_chat_url, json=body, headers=fwd_headers)
+                    if retry.status_code < 400:
+                        selected_model = fb_model
+                        resp = retry
+                        route_method = "fallback"
+                        reasoning = f"fallback: {original_model} unavailable → {fb_resolved}"
+                        debug_headers["x-uncommon-route-model"] = selected_model
+                        debug_headers["x-uncommon-route-reasoning"] = reasoning
+                        break
+
             if is_virtual:
                 actual_cost: float | None = None
                 if resp.status_code == 200:
@@ -625,6 +762,25 @@ def create_app(
                     savings=savings, latency_us=route_latency_us,
                     session_id=session_id, streaming=False,
                 ))
+
+            if api_format == "anthropic":
+                if resp.status_code == 200:
+                    try:
+                        oai_data = json.loads(resp.content)
+                        anth_data = openai_to_anthropic_response(oai_data, selected_model)
+                        return JSONResponse(anth_data, headers=debug_headers)
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        pass
+                try:
+                    err_body = json.loads(resp.content)
+                    err_msg = err_body.get("error", {}).get("message", "Upstream error")
+                except (json.JSONDecodeError, TypeError):
+                    err_msg = "Upstream error"
+                return JSONResponse(
+                    anthropic_error_response(resp.status_code, err_msg),
+                    status_code=resp.status_code,
+                    headers=debug_headers,
+                )
 
             resp_headers = {
                 "content-type": resp.headers.get("content-type", "application/json"),
@@ -644,8 +800,11 @@ def create_app(
                     latency_us=route_latency_us, session_id=session_id,
                     streaming=is_streaming,
                 ))
+            msg = f"Upstream unreachable: {upstream_chat}"
+            if api_format == "anthropic":
+                return JSONResponse(anthropic_error_response(502, msg), status_code=502, headers=debug_headers)
             return JSONResponse(
-                {"error": {"message": f"Upstream unreachable: {upstream_chat}", "type": "proxy_error"}},
+                {"error": {"message": msg, "type": "proxy_error"}},
                 status_code=502,
                 headers=debug_headers,
             )
@@ -658,23 +817,45 @@ def create_app(
                     latency_us=route_latency_us, session_id=session_id,
                     streaming=is_streaming,
                 ))
+            msg = "Upstream request timed out"
+            if api_format == "anthropic":
+                return JSONResponse(anthropic_error_response(504, msg), status_code=504, headers=debug_headers)
             return JSONResponse(
-                {"error": {"message": "Upstream request timed out", "type": "proxy_error"}},
+                {"error": {"message": msg, "type": "proxy_error"}},
                 status_code=504,
                 headers=debug_headers,
             )
 
-    return Starlette(
-        routes=[
-            Route("/health", handle_health, methods=["GET"]),
-            Route("/v1/models", handle_models, methods=["GET"]),
-            Route("/v1/chat/completions", handle_chat_completions, methods=["POST"]),
-            Route("/v1/spend", handle_spend, methods=["GET", "POST"]),
-            Route("/v1/sessions", handle_sessions, methods=["GET"]),
-            Route("/v1/stats", handle_stats, methods=["GET", "POST"]),
-            Route("/v1/feedback", handle_feedback, methods=["GET", "POST"]),
-        ],
-    )
+    async def handle_chat_completions(request: Request) -> Response:
+        body = await request.json()
+        return await _handle_chat_core(body, request)
+
+    async def handle_messages(request: Request) -> Response:
+        raw = await request.json()
+        body = anthropic_to_openai_request(raw)
+        body["model"] = VIRTUAL_MODEL
+        return await _handle_chat_core(body, request, api_format="anthropic")
+
+    @asynccontextmanager
+    async def _lifespan(app: Starlette) -> _LifespanGen[None, None]:
+        await _on_startup()
+        yield
+
+    routes = [
+        Route("/health", handle_health, methods=["GET"]),
+        Route("/v1/models", handle_models, methods=["GET"]),
+        Route("/v1/models/mapping", handle_models_mapping, methods=["GET"]),
+        Route("/v1/chat/completions", handle_chat_completions, methods=["POST"]),
+        Route("/v1/messages", handle_messages, methods=["POST"]),
+        Route("/v1/spend", handle_spend, methods=["GET", "POST"]),
+        Route("/v1/sessions", handle_sessions, methods=["GET"]),
+        Route("/v1/stats", handle_stats, methods=["GET", "POST"]),
+        Route("/v1/feedback", handle_feedback, methods=["GET", "POST"]),
+    ]
+    if _dashboard_mount is not None:
+        routes.append(Mount("/dashboard", app=_dashboard_mount))
+
+    return Starlette(routes=routes, lifespan=_lifespan)
 
 
 def serve(
@@ -701,6 +882,7 @@ def serve(
         print(f"[UncommonRoute] WARNING: No upstream configured — requests will return 503")
         print(f"[UncommonRoute] Set UNCOMMON_ROUTE_UPSTREAM and UNCOMMON_ROUTE_API_KEY to enable forwarding")
     print(f"[UncommonRoute] Virtual model: {VIRTUAL_MODEL}")
+    print(f"[UncommonRoute] Endpoints: /v1/chat/completions (OpenAI) + /v1/messages (Anthropic)")
     print(f"[UncommonRoute] Session persistence: enabled")
     print(f"[UncommonRoute] Spend control: enabled")
     uvicorn.run(app, host=host, port=port, log_level="info")

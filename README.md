@@ -13,7 +13,8 @@ Pure local — no external API calls for routing decisions.
 <img src="https://img.shields.io/badge/98%25_Accuracy-success?style=for-the-badge" alt="98% accuracy">&nbsp;
 <img src="https://img.shields.io/badge/<1ms_Latency-blue?style=for-the-badge" alt="<1ms">&nbsp;
 <img src="https://img.shields.io/badge/Zero_External_Calls-purple?style=for-the-badge" alt="Local">&nbsp;
-<img src="https://img.shields.io/badge/OpenAI_Compatible-orange?style=for-the-badge" alt="OpenAI compatible">
+<img src="https://img.shields.io/badge/OpenAI_Compatible-orange?style=for-the-badge" alt="OpenAI compatible">&nbsp;
+<img src="https://img.shields.io/badge/Anthropic_Compatible-blueviolet?style=for-the-badge" alt="Anthropic compatible">
 
 <br><br>
 
@@ -30,13 +31,16 @@ Pure local — no external API calls for routing decisions.
 
 | Section | Description |
 |---|---|
-| [Quick Start](#quick-start) | Install in 30 seconds |
-| [Usage Modes](#usage-modes) | CLI, SDK, Proxy, OpenClaw |
+| [Quick Start](#quick-start) | Install and choose your client |
+| [Usage Modes](#usage-modes) | CLI, SDK, Proxy, Claude Code, Codex, OpenClaw |
+| [Dashboard](#dashboard) | Web UI for monitoring and management |
 | [How It Works](#how-it-works) | Cascade classifier architecture |
+| [Model Mapping](#model-mapping) | Automatic upstream model discovery |
 | [Routing Tiers](#routing-tiers) | SIMPLE → MEDIUM → COMPLEX → REASONING |
 | [Step-Aware Routing](#step-aware-routing) | Per-step model selection for agent workflows |
 | [Session Management](#session-management) | Smart sessions, auto-escalation |
 | [Spend Control](#spend-control) | Per-request, hourly, daily limits |
+| [Diagnostics](#diagnostics) | doctor, logs, background mode |
 | [Models & Pricing](#models--pricing) | Supported models and costs |
 | [Configuration](#configuration) | Upstream, env vars, BYOK |
 | [Benchmarks](#benchmarks) | Accuracy & latency results |
@@ -45,45 +49,44 @@ Pure local — no external API calls for routing decisions.
 
 ## Quick Start
 
-**1. Install:**
-
 ```bash
 pip install uncommon-route
 ```
 
-**2. Configure upstream** (any OpenAI-compatible API):
+**Choose your client:**
 
-```bash
-# Pick one — or see .env.example for more options
-export UNCOMMON_ROUTE_UPSTREAM="https://api.openai.com/v1"
-export UNCOMMON_ROUTE_API_KEY="sk-..."
-```
+| Client | Setup command |
+|---|---|
+| **CLI / Python SDK** | No config needed — `uncommon-route route "hello"` |
+| **Claude Code** | `uncommon-route setup claude-code` |
+| **OpenAI Codex** | `uncommon-route setup codex` |
+| **OpenAI SDK / Cursor** | `uncommon-route setup openai` |
+| **OpenClaw** | `openclaw plugins install @anjieyang/uncommon-route` |
 
-**3. Use it:**
-
-```bash
-# Local classification (no API key needed)
-uncommon-route route "what is 2+2"
-
-# Start the proxy (requires upstream)
-uncommon-route serve
-```
+Each `setup` command prints the exact environment variables for your shell.
 
 <details>
-<summary>Alternative: one-line installer</summary>
+<summary>Manual setup (all clients)</summary>
 
 ```bash
-curl -fsSL https://anjieyang.github.io/uncommon-route/install | bash
+# 1. Configure upstream (any OpenAI-compatible API)
+export UNCOMMON_ROUTE_UPSTREAM="https://api.commonstack.ai/v1"
+export UNCOMMON_ROUTE_API_KEY="csk-..."
+
+# 2. Start the proxy
+uncommon-route serve
+
+# 3. Check everything works
+uncommon-route doctor
 ```
 
 </details>
 
 <details>
-<summary>Alternative: OpenClaw plugin</summary>
+<summary>One-line installer</summary>
 
 ```bash
-openclaw plugins install @anjieyang/uncommon-route
-openclaw gateway restart
+curl -fsSL https://anjieyang.github.io/uncommon-route/install | bash
 ```
 
 </details>
@@ -103,6 +106,13 @@ uncommon-route route --json "design a distributed database"
 
 uncommon-route debug "explain quicksort"
 # Per-dimension scoring breakdown (structural + keyword + unicode)
+
+uncommon-route doctor
+# Check Python version, upstream, API key, model discovery, BYOK keys
+
+uncommon-route serve --daemon     # Run proxy in background
+uncommon-route stop               # Stop background proxy
+uncommon-route logs --follow      # Tail background proxy log
 ```
 
 ### 2. Python SDK
@@ -144,15 +154,56 @@ response = client.chat.completions.create(
 )
 ```
 
-| Endpoint | Method | Description |
-|---|---|---|
-| `/v1/chat/completions` | POST | Chat with smart routing |
-| `/v1/models` | GET | Available models |
-| `/v1/spend` | GET/POST | Spend control |
-| `/v1/sessions` | GET | Active sessions |
-| `/health` | GET | Health + status |
+| Endpoint | Method | Format | Description |
+|---|---|---|---|
+| `/v1/chat/completions` | POST | OpenAI | Chat with smart routing |
+| `/v1/messages` | POST | Anthropic | Chat with smart routing (auto-routes all requests) |
+| `/v1/models` | GET | OpenAI | Available models |
+| `/v1/models/mapping` | GET | — | Model name mapping (internal → upstream) |
+| `/v1/spend` | GET/POST | — | Spend control |
+| `/v1/sessions` | GET | — | Active sessions |
+| `/v1/stats` | GET/POST | — | Routing analytics |
+| `/v1/feedback` | GET/POST | — | Online learning feedback |
+| `/health` | GET | — | Health + status |
+| `/dashboard` | GET | — | Web management UI |
 
-### 4. OpenClaw Plugin
+### 4. Claude Code
+
+```bash
+uncommon-route setup claude-code   # prints env vars for your shell
+```
+
+Claude Code connects via the Anthropic Messages API (`/v1/messages`). All requests are automatically smart-routed — the proxy converts between Anthropic and OpenAI formats transparently.
+
+```bash
+# Terminal 1
+uncommon-route serve
+
+# Terminal 2
+export ANTHROPIC_BASE_URL="http://localhost:8403"
+export ANTHROPIC_API_KEY="not-needed"
+claude
+```
+
+### 5. OpenAI Codex
+
+```bash
+uncommon-route setup codex         # prints env vars for your shell
+```
+
+Codex connects via the OpenAI Chat Completions API (`/v1/chat/completions`). Use `model="uncommon-route/auto"` for smart routing.
+
+```bash
+# Terminal 1
+uncommon-route serve
+
+# Terminal 2
+export OPENAI_BASE_URL="http://localhost:8403/v1"
+export OPENAI_API_KEY="not-needed"
+codex
+```
+
+### 6. OpenClaw Plugin
 
 ```bash
 openclaw plugins install @anjieyang/uncommon-route
@@ -166,6 +217,46 @@ The plugin auto-installs Python dependencies, starts the proxy, and registers ev
 | `/spend status` | View spending limits |
 | `/spend set hourly 5.00` | Set hourly limit |
 | `/sessions` | View active sessions |
+
+---
+
+## Dashboard
+
+UncommonRoute includes a built-in web dashboard for monitoring and management. After starting the proxy, visit:
+
+```
+http://127.0.0.1:8403/dashboard/
+```
+
+| Tab | What it shows |
+|---|---|
+| **Overview** | KPI cards (requests, savings, latency, sessions, cost), tier distribution chart, top models |
+| **Routing** | Breakdown by tier, model, and routing method |
+| **Models** | Upstream model discovery status, full internal → resolved mapping table |
+| **Sessions** | Active sessions with model, tier, request count, age |
+| **Spend** | Current limits, set/clear limits, spending history |
+
+Data auto-refreshes every 5 seconds. Built with React + [Tremor](https://tremor.so) + Tailwind CSS.
+
+---
+
+## Model Mapping
+
+Different upstream providers use different model IDs for the same model. For example, UncommonRoute internally uses `moonshot/kimi-k2.5`, but Commonstack expects `moonshotai/kimi-k2.5`.
+
+UncommonRoute handles this automatically:
+
+1. **On startup**, the proxy fetches `/v1/models` from the upstream to discover available models
+2. **Fuzzy matching** maps internal names to upstream names — handles provider prefix differences (`xai/` ↔ `x-ai/`), version format changes (`4.6` ↔ `4-6`), and suffix additions (`-preview`)
+3. **Gateway detection** — gateways (Commonstack, OpenRouter) receive the full `provider/model` format; direct provider APIs receive only the model name
+4. **Fallback retry** — if the upstream rejects a model, the proxy automatically tries the next model in the fallback chain
+
+Check the mapping status:
+
+```bash
+uncommon-route doctor           # Shows model discovery status
+curl localhost:8403/v1/models/mapping   # Full mapping table as JSON
+```
 
 ---
 
@@ -278,6 +369,30 @@ Data persists at `~/.uncommon-route/spending.json`.
 
 ---
 
+## Diagnostics
+
+### Health Check
+
+```bash
+uncommon-route doctor
+```
+
+Checks Python version, upstream connectivity, API key validity, model discovery, BYOK provider status, and daemon state. Run this first when something isn't working.
+
+### Background Mode
+
+```bash
+uncommon-route serve --daemon     # Start in background, logs to ~/.uncommon-route/serve.log
+uncommon-route stop               # Stop the background instance
+uncommon-route logs               # Show last 50 lines of log
+uncommon-route logs --follow      # Stream logs in real-time (Ctrl+C to stop)
+uncommon-route logs --limit 100   # Show last 100 lines
+```
+
+PID file: `~/.uncommon-route/serve.pid`. Log file: `~/.uncommon-route/serve.log`.
+
+---
+
 ## Models & Pricing
 
 The router selects models by tier to minimize cost. Availability depends on your upstream provider — multi-provider gateways (OpenRouter, Commonstack) expose all of these; direct provider APIs expose only their own models.
@@ -339,11 +454,15 @@ If you have API keys for specific providers and want the router to **prefer thos
 
 ```bash
 uncommon-route provider add openai sk-your-openai-key
+# Key verified: 47 models available ← auto-validates on add
+
 uncommon-route provider add anthropic sk-ant-your-key
 uncommon-route provider list
 ```
 
 When a BYOK provider is registered, the router will prefer your keyed models whenever they appear in a tier's candidate list. For example, adding an OpenAI key means COMPLEX-tier prompts will prefer `openai/gpt-5.2` over the default `google/gemini-3.1-pro`.
+
+Keys are automatically verified on add. If verification fails, the key is still saved but a warning is shown. Use `uncommon-route doctor` to re-check all provider connections.
 
 Provider config is stored at `~/.uncommon-route/providers.json`.
 
@@ -402,16 +521,17 @@ cd bench && python run.py
 │   │   ├── keywords.py       # 12 keyword features
 │   │   ├── selector.py       # Tier → model + fallback chain
 │   │   └── model.json        # Trained weights
-│   ├── proxy.py              # OpenAI-compatible ASGI proxy
+│   ├── proxy.py              # ASGI proxy (OpenAI + Anthropic endpoints)
+│   ├── anthropic_compat.py   # Anthropic ↔ OpenAI format conversion
+│   ├── model_map.py          # Dynamic upstream model discovery + fuzzy matching
 │   ├── session.py            # Session persistence + escalation
 │   ├── spend_control.py      # Time-windowed spending limits
-│   ├── providers.py          # BYOK provider management
+│   ├── providers.py          # BYOK provider management (with key verification)
 │   ├── openclaw.py           # OpenClaw config integration
-│   └── cli.py                # CLI entry point
+│   ├── cli.py                # CLI entry point (route/serve/setup/doctor/logs)
+│   └── static/               # Built dashboard assets (React + Tremor)
+├── frontend/dashboard/       # Dashboard source (Vite + React + TypeScript)
 ├── openclaw-plugin/          # JS bridge for OpenClaw
-│   ├── src/index.js          # Auto-install + lifecycle management
-│   ├── package.json          # @anjieyang/uncommon-route
-│   └── openclaw.plugin.json  # Plugin manifest
 ├── tests/                    # 169 tests (unit + integration + E2E)
 ├── bench/                    # Benchmarking suite + datasets
 ├── scripts/install.sh        # One-line installer

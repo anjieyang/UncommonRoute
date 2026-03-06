@@ -1,7 +1,7 @@
 [project]
 name = "uncommon-route"
-version = "0.1.2"
-description = "SOTA LLM router — 98% accuracy, cascade classifier, <1ms local routing"
+version = "0.2.0"
+description = "SOTA LLM router — 98% accuracy, OpenAI + Anthropic compatible, <1ms local routing"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 readme = "README.md"
@@ -49,7 +49,7 @@ build-backend = "setuptools.build_meta"
 include = ["uncommon_route*"]
 
 [tool.setuptools.package-data]
-uncommon_route = ["router/model.json"]
+uncommon_route = ["router/model.json", "static/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
