@@ -10,6 +10,7 @@ interface Props {
 const NAV = [
   { id: "overview", label: "Overview" },
   { id: "routing", label: "Routing" },
+  { id: "config", label: "Config" },
   { id: "models", label: "Models" },
   { id: "sessions", label: "Sessions" },
   { id: "spend", label: "Spend" },

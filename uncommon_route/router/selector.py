@@ -109,12 +109,21 @@ def select_model(
         kept = len(filtered_candidates) if filtered_candidates else len(configured_candidates)
         reasoning = f"{reasoning} | caps={','.join(capability_notes)} ({kept}/{len(configured_candidates)})"
 
+    if tc.hard_pin and tc.primary in candidates:
+        scoring_candidates = [tc.primary]
+        reasoning = f"{reasoning} | chooser=hard-pin"
+    elif tc.hard_pin:
+        scoring_candidates = candidates
+        reasoning = f"{reasoning} | chooser=hard-pin-relaxed"
+    else:
+        scoring_candidates = candidates
+
     # R2-Router: estimate optimal output budget from prompt + tier
     budget = estimate_output_budget(prompt, tier.value)
     effective_output = min(max_output_tokens, budget)
 
     candidate_scores = _score_candidates(
-        candidates,
+        scoring_candidates,
         profile=profile,
         tier=tier,
         effective_output=effective_output,
@@ -137,7 +146,8 @@ def select_model(
     cost = candidate_scores[0].predicted_cost
     if user_keyed_models and model in user_keyed_models:
         reasoning = f"byok-preferred ({model}) | {reasoning}"
-    reasoning = f"{reasoning} | chooser=adaptive"
+    if "chooser=hard-pin" not in reasoning:
+        reasoning = f"{reasoning} | chooser=adaptive"
 
     bp = pricing.get(BASELINE_MODEL, ModelPricing(5.0, 25.0))
     baseline_cost = (
@@ -149,14 +159,18 @@ def select_model(
 
     # Build fallback chain in configured profile order. Costs are attached for visibility.
     chain: list[FallbackOption] = []
-    for scored in candidate_scores:
-        fb_model = scored.model
+    if tc.hard_pin:
+        fallback_models = candidates
+    else:
+        fallback_models = [scored.model for scored in candidate_scores]
+    for fb_model in fallback_models:
+        exp = _experience_snapshot(model_experience, fb_model, profile, tier)
         fb_cost = _calc_cost(
             fb_model,
             estimated_input_tokens,
             effective_output,
             pricing,
-            input_cost_multiplier=scored.effective_cost_multiplier,
+            input_cost_multiplier=exp.input_cost_multiplier,
         )
         chain.append(FallbackOption(
             model=fb_model,

@@ -19,6 +19,7 @@ export interface Health {
   };
   stats: { total_requests: number };
   feedback: { pending: number; total_updates: number; online_model: boolean };
+  routing_config?: { source: string; editable: boolean };
 }
 
 export interface TierStats {
@@ -38,10 +39,19 @@ export interface Stats {
   time_range_s: number;
   avg_confidence: number;
   avg_savings: number;
-  avg_latency_us: number;
+  avg_latency_ms: number;
+  avg_input_reduction_ratio: number;
+  avg_cache_hit_ratio: number;
   total_estimated_cost: number;
+  total_baseline_cost: number;
   total_actual_cost: number;
+  total_savings_absolute: number;
+  total_savings_ratio: number;
+  total_cache_savings: number;
+  total_compaction_savings: number;
   total_cache_breakpoints: number;
+  total_input_tokens_before: number;
+  total_input_tokens_after: number;
   by_tier: Record<string, TierStats>;
   by_model: Record<string, ModelStats>;
   by_transport: Record<string, ModelStats>;
@@ -81,6 +91,24 @@ export interface Spend {
   calls: number;
 }
 
+export interface RoutingTierConfig {
+  primary: string;
+  fallback: string[];
+  overridden: boolean;
+  hard_pin: boolean;
+  selection_mode: "adaptive" | "hard-pin";
+}
+
+export interface RoutingProfileConfig {
+  tiers: Record<string, RoutingTierConfig>;
+}
+
+export interface RoutingConfigState {
+  source: string;
+  editable: boolean;
+  profiles: Record<string, RoutingProfileConfig>;
+}
+
 async function get<T>(path: string): Promise<T | null> {
   try {
     const res = await fetch(path);
@@ -96,6 +124,7 @@ export const fetchMapping = () => get<Mapping>("/v1/models/mapping");
 export const fetchSessions = () =>
   get<{ count: number; sessions: Session[] }>("/v1/sessions");
 export const fetchSpend = () => get<Spend>("/v1/spend");
+export const fetchRoutingConfig = () => get<RoutingConfigState>("/v1/routing-config");
 
 export async function setSpendLimit(
   window: string,
@@ -123,6 +152,54 @@ export async function clearSpendLimit(window: string): Promise<boolean> {
     return res.ok;
   } catch {
     return false;
+  }
+}
+
+export async function setRoutingTier(
+  profile: string,
+  tier: string,
+  primary: string,
+  fallback: string[],
+  selectionMode: "adaptive" | "hard-pin",
+): Promise<RoutingConfigState | null> {
+  try {
+    const res = await fetch("/v1/routing-config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "set-tier", profile, tier, primary, fallback, selection_mode: selectionMode }),
+    });
+    return res.ok ? ((await res.json()) as RoutingConfigState) : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function resetRoutingTier(
+  profile: string,
+  tier: string,
+): Promise<RoutingConfigState | null> {
+  try {
+    const res = await fetch("/v1/routing-config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "reset-tier", profile, tier }),
+    });
+    return res.ok ? ((await res.json()) as RoutingConfigState) : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function resetRoutingConfig(): Promise<RoutingConfigState | null> {
+  try {
+    const res = await fetch("/v1/routing-config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "reset" }),
+    });
+    return res.ok ? ((await res.json()) as RoutingConfigState) : null;
+  } catch {
+    return null;
   }
 }
 

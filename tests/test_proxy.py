@@ -12,6 +12,7 @@ from uncommon_route.composition import CompositionPolicy
 from uncommon_route.model_experience import InMemoryModelExperienceStorage, ModelExperienceStore
 from uncommon_route.proxy import _extract_prompt, create_app
 from uncommon_route.router.config import routing_profile_from_model
+from uncommon_route.routing_config_store import InMemoryRoutingConfigStorage, RoutingConfigStore
 from uncommon_route.session import SessionConfig, SessionStore
 from uncommon_route.semantic import SemanticCallResult, SideChannelConfig, SideChannelTaskConfig
 from uncommon_route.spend_control import InMemorySpendControlStorage, SpendControl
@@ -255,6 +256,146 @@ class TestSelectorEndpoint:
         data = resp.json()
         assert data["step_type"] == "tool-selection"
         assert data["decision_tier"] == "MEDIUM"
+
+
+class TestRoutingConfigEndpoint:
+    def test_get_routing_config_returns_profiles(self, client: TestClient) -> None:
+        resp = client.get("/v1/routing-config")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["editable"] is True
+        assert "auto" in data["profiles"]
+        assert data["profiles"]["auto"]["tiers"]["SIMPLE"]["primary"]
+        assert data["profiles"]["auto"]["tiers"]["SIMPLE"]["selection_mode"] == "adaptive"
+
+    def test_post_set_tier_updates_selector_preview(self, client: TestClient) -> None:
+        resp = client.post("/v1/routing-config", json={
+            "action": "set-tier",
+            "profile": "auto",
+            "tier": "MEDIUM",
+            "primary": "openai/gpt-4o-mini",
+            "fallback": [],
+        })
+
+        assert resp.status_code == 200
+        updated = resp.json()
+        assert updated["profiles"]["auto"]["tiers"]["MEDIUM"]["primary"] == "openai/gpt-4o-mini"
+        assert updated["profiles"]["auto"]["tiers"]["MEDIUM"]["overridden"] is True
+
+        preview = client.post("/v1/selector", json={
+            "profile": "auto",
+            "prompt": "Return valid JSON with keys a and b.",
+            "max_tokens": 128,
+        })
+
+        assert preview.status_code == 200
+        data = preview.json()
+        assert data["decision_tier"] == "MEDIUM"
+        assert data["decision_model"] == "openai/gpt-4o-mini"
+        assert data["active_tier_configs"]["MEDIUM"]["primary"] == "openai/gpt-4o-mini"
+        assert data["active_tier_configs"]["MEDIUM"]["selection_mode"] == "adaptive"
+
+    def test_hard_pin_forces_primary_over_adaptive_cheaper_candidate(self, client: TestClient) -> None:
+        adaptive = client.post("/v1/routing-config", json={
+            "action": "set-tier",
+            "profile": "eco",
+            "tier": "SIMPLE",
+            "primary": "openai/gpt-4o",
+            "fallback": ["nvidia/gpt-oss-120b"],
+            "selection_mode": "adaptive",
+        })
+        assert adaptive.status_code == 200
+
+        adaptive_preview = client.post("/v1/selector", json={
+            "profile": "eco",
+            "prompt": "hello",
+            "max_tokens": 64,
+        })
+        assert adaptive_preview.status_code == 200
+        adaptive_model = adaptive_preview.json()["decision_model"]
+
+        pinned = client.post("/v1/routing-config", json={
+            "action": "set-tier",
+            "profile": "eco",
+            "tier": "SIMPLE",
+            "primary": "openai/gpt-4o",
+            "fallback": ["nvidia/gpt-oss-120b"],
+            "selection_mode": "hard-pin",
+        })
+        assert pinned.status_code == 200
+
+        pinned_preview = client.post("/v1/selector", json={
+            "profile": "eco",
+            "prompt": "hello",
+            "max_tokens": 64,
+        })
+
+        assert pinned_preview.status_code == 200
+        pinned_data = pinned_preview.json()
+        assert pinned_data["decision_tier"] == "SIMPLE"
+        assert pinned_data["decision_model"] == "openai/gpt-4o"
+        assert pinned_data["active_tier_configs"]["SIMPLE"]["selection_mode"] == "hard-pin"
+        assert adaptive_model != pinned_data["decision_model"]
+
+    def test_hard_pin_overrides_session_hold(self, client: TestClient) -> None:
+        headers = {"x-session-id": "pinned-session"}
+        client.post("/v1/chat/completions", json={
+            "model": "uncommon-route/auto",
+            "messages": [{"role": "user", "content": "design a distributed system with formal guarantees"}],
+        }, headers=headers)
+
+        pinned = client.post("/v1/routing-config", json={
+            "action": "set-tier",
+            "profile": "auto",
+            "tier": "SIMPLE",
+            "primary": "openai/gpt-4o-mini",
+            "fallback": [],
+            "selection_mode": "hard-pin",
+        })
+        assert pinned.status_code == 200
+
+        preview = client.post("/v1/selector", json={
+            "profile": "auto",
+            "prompt": "hello",
+            "max_tokens": 64,
+        }, headers=headers)
+
+        assert preview.status_code == 200
+        data = preview.json()
+        assert data["method"] == "hard-pin"
+        assert data["served_model"] == "openai/gpt-4o-mini"
+
+    def test_post_reset_tier_restores_default(self) -> None:
+        store = RoutingConfigStore(storage=InMemoryRoutingConfigStorage())
+        app = create_app(
+            upstream="http://127.0.0.1:1/fake",
+            session_store=SessionStore(SessionConfig(enabled=True, timeout_s=300)),
+            spend_control=SpendControl(storage=InMemorySpendControlStorage()),
+            routing_config_store=store,
+        )
+        client = TestClient(app, raise_server_exceptions=False)
+
+        set_resp = client.post("/v1/routing-config", json={
+            "action": "set-tier",
+            "profile": "auto",
+            "tier": "SIMPLE",
+            "primary": "openai/gpt-4o-mini",
+            "fallback": ["moonshot/kimi-k2.5"],
+        })
+        assert set_resp.status_code == 200
+
+        reset_resp = client.post("/v1/routing-config", json={
+            "action": "reset-tier",
+            "profile": "auto",
+            "tier": "SIMPLE",
+        })
+
+        assert reset_resp.status_code == 200
+        reset_data = reset_resp.json()
+        assert reset_data["profiles"]["auto"]["tiers"]["SIMPLE"]["primary"] == "moonshot/kimi-k2.5"
+        assert reset_data["profiles"]["auto"]["tiers"]["SIMPLE"]["overridden"] is False
+        assert reset_data["profiles"]["auto"]["tiers"]["SIMPLE"]["selection_mode"] == "adaptive"
 
 
 class TestChatCompletions:

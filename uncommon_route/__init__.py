@@ -100,6 +100,12 @@ from uncommon_route.model_experience import (
     ModelExperienceStore,
     ModelExperienceStorage,
 )
+from uncommon_route.routing_config_store import (
+    FileRoutingConfigStorage,
+    InMemoryRoutingConfigStorage,
+    RoutingConfigStorage,
+    RoutingConfigStore,
+)
 
 __all__ = [
     # Router
@@ -184,6 +190,10 @@ __all__ = [
     "ModelExperienceRecord",
     "ModelExperienceStore",
     "ModelExperienceStorage",
+    "RoutingConfigStorage",
+    "FileRoutingConfigStorage",
+    "InMemoryRoutingConfigStorage",
+    "RoutingConfigStore",
     # Stats
     "RouteRecord",
     "RouteStats",

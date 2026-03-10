@@ -201,6 +201,7 @@ Available virtual routing profiles:
 | `/v1/sessions` | GET | — | Active sessions |
 | `/v1/stats` | GET/POST | — | Routing analytics |
 | `/v1/selector` | GET/POST | — | Selector state + routing preview |
+| `/v1/routing-config` | GET/POST | — | Live profile/tier model overrides |
 | `/v1/artifacts` | GET | — | Stored large tool outputs |
 | `/v1/artifacts/{id}` | GET | — | Retrieve a stored artifact |
 | `/v1/feedback` | GET/POST | — | Online learning feedback |
@@ -276,6 +277,7 @@ http://127.0.0.1:8403/dashboard/
 |---|---|
 | **Overview** | KPI cards (requests, savings, latency, sessions, cost), tier distribution chart, top models, transport/cache usage summary |
 | **Routing** | Breakdown by tier, model, routing method, upstream transport, cache mode/family, cache breakpoints |
+| **Config** | Edit primary/fallback models for each profile and tier, with live save/reset |
 | **Models** | Upstream model discovery status, full internal → resolved mapping table |
 | **Sessions** | Active sessions with model, tier, request count, age |
 | **Spend** | Current limits, set/clear limits, spending history |
@@ -284,7 +286,20 @@ The dashboard handles edge cases gracefully: a loading spinner while connecting,
 
 Data auto-refreshes every 5 seconds. Built with React + [Tremor](https://tremor.so) + Tailwind CSS.
 
-`GET /v1/stats` also exposes the same transport/cache observability data programmatically via `by_transport`, `by_cache_mode`, `by_cache_family`, and `total_cache_breakpoints`.
+`GET /v1/stats` also exposes the same transport/cache observability data programmatically via `by_transport`, `by_cache_mode`, `by_cache_family`, `total_cache_breakpoints`, and the cost delta fields (`total_baseline_cost`, `total_actual_cost`, `total_savings_absolute`, `total_cache_savings`, `total_compaction_savings`). The baseline is fully uncached `anthropic/claude-opus-4.6` list pricing on the full request context.
+
+Routing defaults are now editable at runtime:
+
+```bash
+uncommon-route config show
+uncommon-route config set-tier auto SIMPLE moonshot/kimi-k2.5 --fallback google/gemini-2.5-flash-lite,deepseek/deepseek-chat
+uncommon-route config set-tier premium COMPLEX anthropic/claude-opus-4.6 --fallback anthropic/claude-sonnet-4.6 --mode hard-pin
+uncommon-route config reset-tier auto SIMPLE
+```
+
+Use `--mode hard-pin` when you want the router to pin a tier to the configured `primary` and only fall back on upstream model errors. `adaptive` keeps the current chooser/bandit behavior across the whole candidate set.
+
+For live updates against a running proxy, use the dashboard Config tab or `POST /v1/routing-config`.
 
 ---
 

@@ -9,6 +9,7 @@ from uncommon_route.model_experience import (
     ModelExperienceStore,
 )
 from uncommon_route.providers import ProvidersConfig
+from uncommon_route.routing_config_store import InMemoryRoutingConfigStorage, RoutingConfigStore
 from uncommon_route.session import SessionConfig, SessionStore
 from uncommon_route.spend_control import InMemorySpendControlStorage, SpendControl
 
@@ -32,4 +33,8 @@ def _isolate_proxy_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "uncommon_route.proxy.ModelExperienceStore",
         lambda: ModelExperienceStore(storage=InMemoryModelExperienceStorage()),
+    )
+    monkeypatch.setattr(
+        "uncommon_route.proxy.RoutingConfigStore",
+        lambda: RoutingConfigStore(storage=InMemoryRoutingConfigStorage()),
     )

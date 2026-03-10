@@ -16,11 +16,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 from uncommon_route.paths import data_dir
+from uncommon_route.router.config import DEFAULT_MODEL_PRICING
 
 RETENTION_S = 7 * 86_400  # 7 days
 MAX_RECORDS = 10_000
 
-RouteMethod = Literal["cascade", "session-hold", "session-upgrade", "step-aware", "escalated", "fallback", "passthrough"]
+RouteMethod = Literal["cascade", "session-hold", "session-upgrade", "step-aware", "escalated", "fallback", "hard-pin", "passthrough"]
 
 _DATA_DIR = data_dir()
 
@@ -33,6 +34,7 @@ class RouteRecord:
     confidence: float
     method: RouteMethod
     estimated_cost: float
+    baseline_cost: float = 0.0
     requested_model: str = ""
     profile: str = "auto"
     decision_tier: str = ""
@@ -100,7 +102,12 @@ class StatsSummary:
     avg_input_reduction_ratio: float
     avg_cache_hit_ratio: float
     total_estimated_cost: float
+    total_baseline_cost: float
     total_actual_cost: float
+    total_savings_absolute: float
+    total_savings_ratio: float
+    total_cache_savings: float
+    total_compaction_savings: float
     total_usage_input_tokens: int
     total_usage_output_tokens: int
     total_cache_read_input_tokens: int
@@ -173,6 +180,42 @@ def _effective_cost(r: RouteRecord) -> float:
     return main_cost + side_cost
 
 
+def _baseline_cost(r: RouteRecord) -> float:
+    if r.baseline_cost > 0:
+        return r.baseline_cost
+    main_estimated = max(0.0, r.estimated_cost - r.sidechannel_estimated_cost)
+    if main_estimated <= 0:
+        return 0.0
+    if 0.0 <= r.savings < 0.999999:
+        denominator = 1.0 - r.savings
+        if denominator > 0:
+            return main_estimated / denominator
+    if r.savings == 0.0:
+        return main_estimated
+    return 0.0
+
+
+def _cache_savings(r: RouteRecord) -> float:
+    pricing = DEFAULT_MODEL_PRICING.get(r.model)
+    if pricing is None:
+        return 0.0
+    cached_input_price = pricing.cached_input_price if pricing.cached_input_price is not None else pricing.input_price
+    cache_write_price = pricing.cache_write_price if pricing.cache_write_price is not None else pricing.input_price
+    read_delta = ((pricing.input_price - cached_input_price) * r.cache_read_input_tokens) / 1_000_000
+    write_delta = ((pricing.input_price - cache_write_price) * r.cache_write_input_tokens) / 1_000_000
+    return read_delta + write_delta
+
+
+def _compaction_savings(r: RouteRecord) -> float:
+    if r.input_tokens_before <= r.input_tokens_after:
+        return 0.0
+    pricing = DEFAULT_MODEL_PRICING.get(r.model)
+    if pricing is None:
+        return 0.0
+    reduced_tokens = r.input_tokens_before - r.input_tokens_after
+    return (reduced_tokens / 1_000_000) * pricing.input_price
+
+
 class RouteStats:
     """Route-level statistics collector with persistent storage."""
 
@@ -232,7 +275,9 @@ class RouteStats:
                 by_profile={}, by_method={},
                 avg_confidence=0.0, avg_savings=0.0, avg_latency_us=0.0,
                 avg_input_reduction_ratio=0.0, avg_cache_hit_ratio=0.0,
-                total_estimated_cost=0.0, total_actual_cost=0.0,
+                total_estimated_cost=0.0, total_baseline_cost=0.0, total_actual_cost=0.0,
+                total_savings_absolute=0.0, total_savings_ratio=0.0,
+                total_cache_savings=0.0, total_compaction_savings=0.0,
                 total_usage_input_tokens=0, total_usage_output_tokens=0,
                 total_cache_read_input_tokens=0, total_cache_write_input_tokens=0,
                 total_cache_breakpoints=0,
@@ -314,7 +359,12 @@ class RouteStats:
             if r.input_tokens_before > 0
         ]
         total_est = sum(r.estimated_cost for r in self._records)
+        total_baseline = sum(_baseline_cost(r) for r in self._records)
         total_act = sum(_effective_cost(r) for r in self._records)
+        total_cache_savings = sum(_cache_savings(r) for r in self._records)
+        total_compaction_savings = sum(_compaction_savings(r) for r in self._records)
+        total_savings_absolute = total_baseline - total_act
+        total_savings_ratio = (total_savings_absolute / total_baseline) if total_baseline > 0 else 0.0
 
         return StatsSummary(
             total_requests=n,
@@ -333,7 +383,12 @@ class RouteStats:
             avg_input_reduction_ratio=(sum(ratios) / len(ratios)) if ratios else 0.0,
             avg_cache_hit_ratio=sum(r.cache_hit_ratio for r in self._records) / n,
             total_estimated_cost=total_est,
+            total_baseline_cost=total_baseline,
             total_actual_cost=total_act,
+            total_savings_absolute=total_savings_absolute,
+            total_savings_ratio=total_savings_ratio,
+            total_cache_savings=total_cache_savings,
+            total_compaction_savings=total_compaction_savings,
             total_usage_input_tokens=sum(r.usage_input_tokens for r in self._records),
             total_usage_output_tokens=sum(r.usage_output_tokens for r in self._records),
             total_cache_read_input_tokens=sum(r.cache_read_input_tokens for r in self._records),
@@ -377,6 +432,7 @@ class RouteStats:
                 "confidence": r.confidence,
                 "method": r.method,
                 "estimated_cost": r.estimated_cost,
+                "baseline_cost": r.baseline_cost,
                 "actual_cost": r.actual_cost,
                 "savings": r.savings,
                 "latency_us": r.latency_us,
@@ -425,6 +481,7 @@ class RouteStats:
                 confidence=r.get("confidence", 0.0),
                 method=r.get("method", "cascade"),
                 estimated_cost=r.get("estimated_cost", 0.0),
+                baseline_cost=r.get("baseline_cost", 0.0),
                 actual_cost=r.get("actual_cost"),
                 savings=r.get("savings", 0.0),
                 latency_us=r.get("latency_us", 0.0),

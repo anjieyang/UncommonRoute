@@ -108,6 +108,7 @@ class CandidateScore:
 class TierConfig:
     primary: str
     fallback: list[str] = field(default_factory=list)
+    hard_pin: bool = False
 
 
 @dataclass(frozen=True, slots=True)

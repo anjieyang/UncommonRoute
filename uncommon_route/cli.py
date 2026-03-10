@@ -11,6 +11,7 @@ Subcommands:
     openclaw — manage OpenClaw integration (install/uninstall/status)
     spend    — manage spending limits (set/clear/status/history)
     provider — API key management (BYOK)
+    config   — routing profile/tier defaults
     stats    — routing analytics (summary/history/reset)
     sessions — show active session stats
 
@@ -34,7 +35,7 @@ from uncommon_route.router.classifier import classify
 from uncommon_route.router.structural import extract_structural_features, extract_unicode_block_features
 from uncommon_route.router.keywords import extract_keyword_features
 
-VERSION = "0.2.6"
+VERSION = "0.2.7"
 _DATA_DIR = data_dir()
 _PID_FILE = _DATA_DIR / "serve.pid"
 _LOG_FILE = _DATA_DIR / "serve.log"
@@ -60,6 +61,7 @@ Commands:
   openclaw <sub>                    OpenClaw integration (install|uninstall|status)
   spend <sub>                       Spending limits (status|set|clear|history)
   provider <sub>                    API key management (list|add|remove|models)
+  config <sub>                      Routing config (show|set-tier|reset-tier|reset)
   stats [sub]                       Routing analytics (summary|history|reset)
   sessions                          Show active session stats
   --version                         Show version
@@ -108,6 +110,13 @@ Stats subcommands:
   stats history [--limit <n>]         Recent routing decisions
   stats reset                         Clear all stats
 
+Config subcommands:
+  config show [--json]                Show active profile/tier routing config
+  config set-tier <profile> <tier> <primary> [--fallback <csv>] [--mode adaptive|hard-pin]
+                                      Override one profile/tier routing table
+  config reset-tier <profile> <tier>  Remove one override
+  config reset                        Clear all routing overrides
+
 Setup subcommands:
   setup claude-code [--port <n>]      Generate Claude Code environment config
   setup codex [--port <n>]            Generate OpenAI Codex environment config
@@ -122,6 +131,7 @@ Examples:
   uncommon-route logs --follow
   uncommon-route spend set hourly 5.00
   uncommon-route provider add deepseek sk-...
+  uncommon-route config set-tier auto SIMPLE moonshot/kimi-k2.5 --fallback google/gemini-2.5-flash-lite,deepseek/deepseek-chat --mode adaptive
 """)
 
 
@@ -208,7 +218,7 @@ def _cmd_route(args: list[str]) -> None:
                 {"model": fb.model, "cost": round(fb.cost_estimate, 6)}
                 for fb in decision.fallback_chain
             ],
-            "latency_us": round(elapsed_us, 1),
+            "latency_ms": round(elapsed_us / 1000.0, 3),
         }, indent=2))
         return
 
@@ -217,7 +227,7 @@ def _cmd_route(args: list[str]) -> None:
     print(f"  Confidence: {decision.confidence:.2f}")
     print(f"  Cost:       ${decision.cost_estimate:.6f}")
     print(f"  Savings:    {decision.savings:.0%}")
-    print(f"  Latency:    {elapsed_us:.0f}µs")
+    print(f"  Latency:    {elapsed_us / 1000.0:.3f}ms")
     print(f"  Reasoning:  {decision.reasoning}")
     if decision.fallback_chain:
         print(f"  Fallback:   {' → '.join(fb.model for fb in decision.fallback_chain)}")
@@ -562,6 +572,109 @@ def _cmd_provider(args: list[str]) -> None:
     cmd_provider(args)
 
 
+def _print_routing_config(payload: dict[str, object], *, as_json: bool = False) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2))
+        return
+    print("  Routing Config:")
+    print(f"    Source:    {payload.get('source', 'local-file')}")
+    print(f"    Editable:  {'yes' if payload.get('editable', False) else 'no'}")
+    profiles = payload.get("profiles", {})
+    if not isinstance(profiles, dict):
+        return
+    for profile_name in ("free", "eco", "auto", "premium", "agentic"):
+        profile_payload = profiles.get(profile_name)
+        if not isinstance(profile_payload, dict):
+            continue
+        tiers = profile_payload.get("tiers", {})
+        if not isinstance(tiers, dict):
+            continue
+        print(f"\n  {profile_name}:")
+        for tier_name in ("SIMPLE", "MEDIUM", "COMPLEX", "REASONING"):
+            row = tiers.get(tier_name)
+            if not isinstance(row, dict):
+                continue
+            primary = str(row.get("primary", ""))
+            fallback = row.get("fallback", [])
+            overridden = bool(row.get("overridden", False))
+            selection_mode = str(row.get("selection_mode", "adaptive"))
+            suffix = "  [override]" if overridden else ""
+            print(f"    {tier_name:<10} {primary}{suffix}")
+            print(f"               mode: {selection_mode}")
+            if isinstance(fallback, list) and fallback:
+                print(f"               fallback: {', '.join(str(item) for item in fallback)}")
+
+
+def _cmd_config(args: list[str]) -> None:
+    from uncommon_route.router.types import RoutingProfile, Tier
+    from uncommon_route.routing_config_store import RoutingConfigStore
+
+    flags, rest = _parse_flags(args, {"json": False, "fallback": True, "mode": True})
+    store = RoutingConfigStore()
+    if not rest:
+        rest = ["show"]
+
+    sub = rest[0]
+    output_json = bool(flags.get("json", False))
+
+    if sub == "show":
+        _print_routing_config(store.export(), as_json=output_json)
+        return
+
+    if sub == "set-tier":
+        if len(rest) < 4:
+            print(
+                "Usage: uncommon-route config set-tier <profile> <tier> <primary> [--fallback <csv>] [--mode adaptive|hard-pin]",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        try:
+            profile = RoutingProfile(rest[1].strip().lower())
+            tier = Tier(rest[2].strip().upper())
+        except ValueError:
+            print("Error: invalid profile or tier", file=sys.stderr)
+            sys.exit(1)
+        primary = rest[3].strip()
+        fallback_csv = str(flags.get("fallback", rest[4] if len(rest) > 4 else ""))
+        fallback = [part.strip() for part in fallback_csv.split(",") if part.strip()]
+        mode = str(flags.get("mode", "adaptive")).strip().lower()
+        if mode not in {"adaptive", "hard-pin", "hard_pin", "pinned"}:
+            print("Error: --mode must be adaptive or hard-pin", file=sys.stderr)
+            sys.exit(1)
+        payload = store.set_tier(
+            profile,
+            tier,
+            primary=primary,
+            fallback=fallback,
+            hard_pin=mode in {"hard-pin", "hard_pin", "pinned"},
+        )
+        _print_routing_config(payload, as_json=output_json)
+    elif sub == "reset-tier":
+        if len(rest) < 3:
+            print("Usage: uncommon-route config reset-tier <profile> <tier>", file=sys.stderr)
+            sys.exit(1)
+        try:
+            profile = RoutingProfile(rest[1].strip().lower())
+            tier = Tier(rest[2].strip().upper())
+        except ValueError:
+            print("Error: invalid profile or tier", file=sys.stderr)
+            sys.exit(1)
+        payload = store.reset_tier(profile, tier)
+        _print_routing_config(payload, as_json=output_json)
+    elif sub == "reset":
+        payload = store.reset()
+        _print_routing_config(payload, as_json=output_json)
+    else:
+        print(f"Unknown config subcommand: {sub}", file=sys.stderr)
+        print("  Available: show, set-tier, reset-tier, reset", file=sys.stderr)
+        sys.exit(1)
+
+    if _PID_FILE.exists() and not output_json:
+        print()
+        print("  Note: persisted overrides were updated.")
+        print("  If a local proxy is already running, restart it or use /v1/routing-config for live updates.")
+
+
 def _cmd_stats(args: list[str]) -> None:
     from uncommon_route.stats import RouteStats
 
@@ -581,7 +694,7 @@ def _cmd_stats(args: list[str]) -> None:
         print(f"  {'─' * 50}")
         print(f"  Avg confidence: {s.avg_confidence:.2f}")
         print(f"  Avg savings:    {s.avg_savings:.0%}")
-        print(f"  Avg latency:    {s.avg_latency_us:.0f}µs")
+        print(f"  Avg latency:    {s.avg_latency_us / 1000.0:.3f}ms")
         print(f"  Avg reduction:  {s.avg_input_reduction_ratio:.0%}")
         print(f"  Avg cache hit:  {s.avg_cache_hit_ratio:.0%}")
         print(f"  Total cost:     ${s.total_actual_cost:.4f} (estimated: ${s.total_estimated_cost:.4f})")
@@ -937,6 +1050,7 @@ def main() -> None:
         "openclaw": _cmd_openclaw,
         "spend": _cmd_spend,
         "provider": _cmd_provider,
+        "config": _cmd_config,
         "stats": _cmd_stats,
         "sessions": _cmd_sessions,
         "feedback": _cmd_feedback,

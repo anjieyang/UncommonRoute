@@ -117,6 +117,46 @@ class TestRouteStats:
         assert abs(s.total_actual_cost - 0.005) < 1e-9
         assert abs(s.total_estimated_cost - 0.01) < 1e-9
 
+    def test_summary_tracks_baseline_and_savings_breakdown(self) -> None:
+        rs = RouteStats(storage=InMemoryRouteStatsStorage())
+        rs.record(RouteRecord(**{
+            **_make_record(
+                model="anthropic/claude-sonnet-4.6",
+                estimated_cost=0.02,
+                actual_cost=0.01,
+            ).__dict__,
+            "baseline_cost": 0.10,
+            "input_tokens_before": 2000,
+            "input_tokens_after": 1000,
+            "cache_read_input_tokens": 1000,
+            "cache_write_input_tokens": 100,
+        }))
+
+        s = rs.summary()
+
+        assert abs(s.total_baseline_cost - 0.10) < 1e-9
+        assert abs(s.total_savings_absolute - 0.09) < 1e-9
+        assert abs(s.total_savings_ratio - 0.9) < 1e-9
+        assert s.total_cache_savings > 0
+        assert s.total_compaction_savings > 0
+
+    def test_summary_infers_baseline_for_legacy_records(self) -> None:
+        rs = RouteStats(storage=InMemoryRouteStatsStorage())
+        rs.record(RouteRecord(**{
+            **_make_record(
+                model="moonshot/kimi-k2.5",
+                estimated_cost=0.01,
+                actual_cost=0.01,
+                savings=0.8,
+            ).__dict__,
+            "baseline_cost": 0.0,
+        }))
+
+        s = rs.summary()
+
+        assert abs(s.total_baseline_cost - 0.05) < 1e-9
+        assert abs(s.total_savings_absolute - 0.04) < 1e-9
+
     def test_summary_tracks_cache_usage(self) -> None:
         rs = RouteStats(storage=InMemoryRouteStatsStorage())
         rec = _make_record()
@@ -267,6 +307,11 @@ class TestStatsEndpoint:
         assert "total_cache_breakpoints" in data
         assert data["avg_confidence"] > 0
         assert "avg_cache_hit_ratio" in data
+        assert "avg_latency_ms" in data
+        assert "total_baseline_cost" in data
+        assert "total_savings_absolute" in data
+        assert "total_cache_savings" in data
+        assert "total_compaction_savings" in data
         assert "selection_profiles" in data["selector"]
         assert "recent_feedback_changes" in data["selector"]["experience"]
 

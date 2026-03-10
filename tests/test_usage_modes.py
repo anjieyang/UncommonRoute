@@ -83,7 +83,7 @@ class TestCLI:
         assert "model" in data
         assert "tier" in data
         assert "confidence" in data
-        assert "latency_us" in data
+        assert "latency_ms" in data
 
     def test_route_complex_prompt(self) -> None:
         r = subprocess.run(

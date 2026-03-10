@@ -49,6 +49,7 @@ from uncommon_route.composition import CompositionPolicy, compose_messages_seman
 from uncommon_route.router.api import route
 from uncommon_route.router.classifier import classify, extract_features
 from uncommon_route.router.config import (
+    BASELINE_MODEL,
     DEFAULT_CONFIG,
     DEFAULT_MODEL_PRICING,
     VIRTUAL_MODEL_IDS,
@@ -72,6 +73,7 @@ from uncommon_route.feedback import FeedbackCollector
 from uncommon_route.model_experience import ModelExperienceStore
 from uncommon_route.providers import ProvidersConfig, load_providers
 from uncommon_route.model_map import ModelMapper
+from uncommon_route.routing_config_store import RoutingConfigStore
 from uncommon_route.anthropic_compat import (
     anthropic_to_openai_request,
     anthropic_to_openai_response,
@@ -82,7 +84,7 @@ from uncommon_route.anthropic_compat import (
     OpenAIToAnthropicStreamConverter,
 )
 
-VERSION = "0.2.6"
+VERSION = "0.2.7"
 DEFAULT_UPSTREAM = os.environ.get("UNCOMMON_ROUTE_UPSTREAM", "")
 DEFAULT_PORT = int(os.environ.get("UNCOMMON_ROUTE_PORT", "8403"))
 VIRTUAL_MODEL = VIRTUAL_MODEL_IDS[RoutingProfile.AUTO]
@@ -136,6 +138,10 @@ def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     if mp is None:
         return 0.0
     return (input_tokens / 1_000_000) * mp.input_price + (output_tokens / 1_000_000) * mp.output_price
+
+
+def _estimate_baseline_cost(input_tokens: int, output_tokens: int) -> float:
+    return _estimate_cost(BASELINE_MODEL, input_tokens, output_tokens)
 
 
 def _estimate_cost_from_usage(model: str, usage: UsageMetrics) -> float | None:
@@ -252,12 +258,12 @@ def _extract_prompt(body: dict) -> tuple[str, str | None, int]:
     return prompt, system_prompt, max_tokens
 
 
-def _build_debug_response(prompt: str, system_prompt: str | None) -> dict:
+def _build_debug_response(prompt: str, system_prompt: str | None, routing_config=DEFAULT_CONFIG) -> dict:
     """Build a debug diagnostics response showing routing details."""
-    result = classify(prompt, system_prompt)
-    decision = route(prompt, system_prompt)
+    result = classify(prompt, system_prompt, routing_config.scoring)
+    decision = route(prompt, system_prompt, config=routing_config)
 
-    tier_boundaries = DEFAULT_CONFIG.scoring.tier_boundaries
+    tier_boundaries = routing_config.scoring.tier_boundaries
     lines = [
         "UncommonRoute Debug",
         "",
@@ -759,7 +765,7 @@ def _set_route_strategy_headers(
         _set_header(headers, "x-uncommon-route-cache-key", cache_plan.prompt_cache_key)
 
 
-def _selection_profiles_payload() -> dict[str, dict[str, float]]:
+def _selection_profiles_payload(config) -> dict[str, dict[str, float]]:
     return {
         profile.value: {
             "editorial": weights.editorial,
@@ -773,11 +779,11 @@ def _selection_profiles_payload() -> dict[str, dict[str, float]]:
             "local_bias": weights.local_bias,
             "reasoning_bias": weights.reasoning_bias,
         }
-        for profile, weights in DEFAULT_CONFIG.selection_profiles.items()
+        for profile, weights in config.selection_profiles.items()
     }
 
 
-def _bandit_profiles_payload() -> dict[str, dict[str, object]]:
+def _bandit_profiles_payload(config) -> dict[str, dict[str, object]]:
     return {
         profile.value: {
             "enabled": cfg.enabled,
@@ -789,7 +795,7 @@ def _bandit_profiles_payload() -> dict[str, dict[str, object]]:
             "max_cost_ratio": cfg.max_cost_ratio,
             "enabled_tiers": [tier.value for tier in cfg.enabled_tiers],
         }
-        for profile, cfg in DEFAULT_CONFIG.bandit_profiles.items()
+        for profile, cfg in config.bandit_profiles.items()
     }
 
 
@@ -895,6 +901,7 @@ def create_app(
     composition_policy: CompositionPolicy | None = None,
     semantic_compressor: SemanticCompressor | None = None,
     model_experience: ModelExperienceStore | None = None,
+    routing_config_store: RoutingConfigStore | None = None,
 ) -> Starlette:
     """Create the ASGI application wired to the given upstream base URL.
 
@@ -919,6 +926,8 @@ def create_app(
     _artifacts = artifact_store or ArtifactStore()
     _composition_policy = composition_policy or load_composition_policy()
     _semantic = semantic_compressor
+    _routing_store = routing_config_store or RoutingConfigStore()
+    _routing_config = _routing_store.config()
 
     upstream_chat = f"{upstream.rstrip('/')}/chat/completions"
     if _semantic is None and upstream:
@@ -953,9 +962,10 @@ def create_app(
         bucket_profile: RoutingProfile | None = None,
         bucket_tier: Tier | None = None,
     ) -> dict[str, Any]:
+        current_config = _routing_config
         state: dict[str, Any] = {
-            "selection_profiles": _selection_profiles_payload(),
-            "bandit_profiles": _bandit_profiles_payload(),
+            "selection_profiles": _selection_profiles_payload(current_config),
+            "bandit_profiles": _bandit_profiles_payload(current_config),
             "experience": _model_experience.summary(),
         }
         if bucket_profile is not None and bucket_tier is not None:
@@ -986,6 +996,7 @@ def create_app(
             prompt,
             system_prompt,
             max_tokens,
+            config=_routing_config,
             routing_profile=routing_profile,
             request_requirements=requirements,
             user_keyed_models=user_keyed,
@@ -1009,14 +1020,26 @@ def create_app(
         }
 
         active_tier_configs = {
-            tier.value: {"primary": tc.primary, "fallback": tc.fallback}
+            tier.value: {
+                "primary": tc.primary,
+                "fallback": tc.fallback,
+                "hard_pin": tc.hard_pin,
+                "selection_mode": "hard-pin" if tc.hard_pin else "adaptive",
+            }
             for tier, tc in get_tier_configs(
-                DEFAULT_CONFIG,
+                _routing_config,
                 decision.profile,
                 agentic=decision.profile is RoutingProfile.AGENTIC
                 or (decision.profile is RoutingProfile.AUTO and requirements.is_agentic),
             ).items()
         }
+        active_tier_config = get_tier_configs(
+            _routing_config,
+            decision.profile,
+            agentic=decision.profile is RoutingProfile.AGENTIC
+            or (decision.profile is RoutingProfile.AUTO and requirements.is_agentic),
+        )[decision.tier]
+        hard_pinned = active_tier_config.hard_pin
 
         if cached_session:
             session_preview["cached"] = {
@@ -1031,7 +1054,13 @@ def create_app(
         if cached_session and cached_session.profile == profile_value:
             session_rank = _TIER_RANK.get(cached_session.tier, 1)
             decision_rank = _TIER_RANK.get(decision.tier.value, 1)
-            if is_lightweight:
+            if hard_pinned:
+                route_method = "hard-pin"
+                reasoning = f"{decision.reasoning} | hard-pin"
+                session_preview["applied"] = True
+                session_preview["action"] = "hard-pin"
+                session_preview["target"] = {"model": selected_model, "tier": served_tier}
+            elif is_lightweight:
                 route_method = "step-aware"
                 reasoning = f"{decision.reasoning} | {step_type}"
                 session_preview["action"] = "step-aware"
@@ -1059,7 +1088,7 @@ def create_app(
                 session_preview["action"] = "hold"
                 session_preview["target"] = {"model": selected_model, "tier": served_tier}
 
-            if session_id and not is_lightweight:
+            if session_id and not is_lightweight and not hard_pinned:
                 content_hash = hash_request_content(prompt, tool_names or None)
                 previous_hash = cached_session.recent_hashes[-1] if cached_session.recent_hashes else ""
                 next_strikes = (cached_session.strikes + 1) if previous_hash == content_hash else 0
@@ -1134,6 +1163,10 @@ def create_app(
                 "keyed_models": sorted(_providers.keyed_models()),
             },
             "selector": _selector_state(),
+            "routing_config": {
+                "source": _routing_store.export().get("source", "local-file"),
+                "editable": _routing_store.export().get("editable", True),
+            },
             "stats": {
                 "total_requests": _stats.count,
             },
@@ -1225,11 +1258,16 @@ def create_app(
             "time_range_s": round(s.time_range_s, 1),
             "avg_confidence": round(s.avg_confidence, 3),
             "avg_savings": round(s.avg_savings, 3),
-            "avg_latency_us": round(s.avg_latency_us, 1),
+            "avg_latency_ms": round(s.avg_latency_us / 1000.0, 3),
             "avg_input_reduction_ratio": round(s.avg_input_reduction_ratio, 3),
             "avg_cache_hit_ratio": round(s.avg_cache_hit_ratio, 3),
             "total_estimated_cost": round(s.total_estimated_cost, 6),
+            "total_baseline_cost": round(s.total_baseline_cost, 6),
             "total_actual_cost": round(s.total_actual_cost, 6),
+            "total_savings_absolute": round(s.total_savings_absolute, 6),
+            "total_savings_ratio": round(s.total_savings_ratio, 6),
+            "total_cache_savings": round(s.total_cache_savings, 6),
+            "total_compaction_savings": round(s.total_compaction_savings, 6),
             "total_usage_input_tokens": s.total_usage_input_tokens,
             "total_usage_output_tokens": s.total_usage_output_tokens,
             "total_cache_read_input_tokens": s.total_cache_read_input_tokens,
@@ -1305,6 +1343,53 @@ def create_app(
             return JSONResponse({"error": error or "Invalid selector payload"}, status_code=400)
         return JSONResponse(_build_selector_preview(normalized_body, request))
 
+    async def handle_routing_config(request: Request) -> JSONResponse:
+        """GET /v1/routing-config — active routing profile/tier config. POST — update overrides."""
+        nonlocal _routing_config
+        if request.method == "GET":
+            return JSONResponse(_routing_store.export())
+
+        body = await request.json()
+        action = str(body.get("action", "")).strip().lower()
+        try:
+            if action == "set-tier":
+                profile = _parse_profile_value(str(body.get("profile", "")))
+                tier = _parse_tier_value(str(body.get("tier", "")))
+                primary = str(body.get("primary", "")).strip()
+                fallback_raw = body.get("fallback", [])
+                selection_mode = str(body.get("selection_mode", "")).strip().lower()
+                hard_pin = bool(body.get("hard_pin", False))
+                if selection_mode:
+                    hard_pin = selection_mode in {"hard-pin", "hard_pin", "pinned"}
+                if isinstance(fallback_raw, str):
+                    fallback = [part.strip() for part in fallback_raw.split(",") if part.strip()]
+                elif isinstance(fallback_raw, list):
+                    fallback = [str(item).strip() for item in fallback_raw if str(item).strip()]
+                else:
+                    return JSONResponse({"error": "fallback must be a list or comma-separated string"}, status_code=400)
+                payload = _routing_store.set_tier(
+                    profile,
+                    tier,
+                    primary=primary,
+                    fallback=fallback,
+                    hard_pin=hard_pin,
+                )
+            elif action == "reset-tier":
+                profile = _parse_profile_value(str(body.get("profile", "")))
+                tier = _parse_tier_value(str(body.get("tier", "")))
+                payload = _routing_store.reset_tier(profile, tier)
+            elif action == "reset":
+                payload = _routing_store.reset()
+            else:
+                return JSONResponse(
+                    {"error": "Invalid action", "allowed": ["set-tier", "reset-tier", "reset"]},
+                    status_code=400,
+                )
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        _routing_config = _routing_store.config()
+        return JSONResponse(payload)
+
     async def handle_artifacts(request: Request) -> JSONResponse:
         limit = int(request.query_params.get("limit", "50"))
         return JSONResponse({
@@ -1379,6 +1464,7 @@ def create_app(
         confidence = 0.0
         savings = 0.0
         estimated_cost = 0.0
+        baseline_cost = 0.0
         session_id: str | None = None
         request_id = ""
         prompt_preview = ""
@@ -1410,7 +1496,7 @@ def create_app(
         if is_virtual:
             if prompt.startswith("/debug"):
                 debug_prompt = prompt[len("/debug"):].strip() or "hello"
-                debug_body = _build_debug_response(debug_prompt, system_prompt)
+                debug_body = _build_debug_response(debug_prompt, system_prompt, _routing_config)
                 if api_format == "anthropic":
                     return JSONResponse(openai_to_anthropic_response(debug_body, "uncommon-route/debug"))
                 return JSONResponse(debug_body)
@@ -1425,6 +1511,7 @@ def create_app(
                 prompt,
                 system_prompt,
                 max_tokens,
+                config=_routing_config,
                 routing_profile=routing_profile or RoutingProfile.AUTO,
                 request_requirements=requirements,
                 user_keyed_models=user_keyed,
@@ -1436,18 +1523,31 @@ def create_app(
             decision_tier = tier_value
             profile_value = decision.profile.value
             active_tier_configs = {
-                tier.value: {"primary": tc.primary, "fallback": tc.fallback}
+                tier.value: {
+                    "primary": tc.primary,
+                    "fallback": tc.fallback,
+                    "hard_pin": tc.hard_pin,
+                    "selection_mode": "hard-pin" if tc.hard_pin else "adaptive",
+                }
                 for tier, tc in get_tier_configs(
-                    DEFAULT_CONFIG,
+                    _routing_config,
                     decision.profile,
                     agentic=decision.profile is RoutingProfile.AGENTIC
                     or (decision.profile is RoutingProfile.AUTO and requirements.is_agentic),
                 ).items()
             }
+            active_tier_config = get_tier_configs(
+                _routing_config,
+                decision.profile,
+                agentic=decision.profile is RoutingProfile.AGENTIC
+                or (decision.profile is RoutingProfile.AUTO and requirements.is_agentic),
+            )[decision.tier]
+            hard_pinned = active_tier_config.hard_pin
             reasoning = decision.reasoning
             if tier_cap is not None:
                 reasoning = f"{reasoning} | tool-selection-cap<={tier_cap.value}"
             estimated_cost = decision.cost_estimate
+            baseline_cost = decision.baseline_cost
             confidence = decision.confidence
             savings = decision.savings
             route_method = "cascade"
@@ -1456,7 +1556,12 @@ def create_app(
                 session_rank = _TIER_RANK.get(cached_session.tier, 1)
                 decision_rank = _TIER_RANK.get(decision.tier.value, 1)
 
-                if is_lightweight:
+                if hard_pinned:
+                    route_method = "hard-pin"
+                    reasoning = f"{decision.reasoning} | hard-pin"
+                    if session_id:
+                        _sessions.set(session_id, selected_model, tier_value, profile=profile_value)
+                elif is_lightweight:
                     # Tool-result steps: use classifier's decision (allow downgrade)
                     route_method = "step-aware"
                     reasoning = f"{decision.reasoning} | {step_type}"
@@ -1481,13 +1586,14 @@ def create_app(
                     estimated_cost = _estimate_cost(
                         selected_model, input_toks, min(max_tokens, output_budget),
                     )
+                    baseline_cost = _estimate_baseline_cost(input_toks, min(max_tokens, output_budget))
 
                 if session_id:
                     _sessions.touch(session_id)
 
                 # Three-strike escalation (skip for lightweight steps — repeated
                 # tool results are expected, not a signal of model inadequacy)
-                if session_id and not is_lightweight:
+                if session_id and not is_lightweight and not hard_pinned:
                     content_hash = hash_request_content(prompt, tool_names or None)
                     should_escalate = _sessions.record_request_hash(session_id, content_hash)
                     if should_escalate:
@@ -1507,6 +1613,7 @@ def create_app(
                             estimated_cost = _estimate_cost(
                                 selected_model, input_toks, min(max_tokens, output_budget),
                             )
+                            baseline_cost = _estimate_baseline_cost(input_toks, min(max_tokens, output_budget))
             else:
                 if session_id:
                     _sessions.set(session_id, selected_model, tier_value, profile=profile_value)
@@ -1546,6 +1653,10 @@ def create_app(
                 input_tokens_after,
                 min(max_tokens, output_budget),
             )
+            baseline_cost = _estimate_baseline_cost(
+                input_tokens_before if input_tokens_before > 0 else input_tokens_after,
+                min(max_tokens, output_budget),
+            )
             main_estimated_cost = estimated_cost
             estimated_cost += sidechannel_estimated_cost
 
@@ -1576,6 +1687,7 @@ def create_app(
             input_tokens_before = estimate_tokens(full_text) if full_text else 0
             input_tokens_after = input_tokens_before
             estimated_cost = _estimate_cost(selected_model, input_tokens_after, max_tokens)
+            baseline_cost = estimated_cost
             main_estimated_cost = estimated_cost
 
         route_latency_us = (time.perf_counter_ns() - route_start) / 1000
@@ -1757,7 +1869,7 @@ def create_app(
                             tier=tier_value,
                             decision_tier=decision_tier or tier_value,
                             confidence=confidence, method=route_method,  # type: ignore[arg-type]
-                            estimated_cost=estimated_cost, actual_cost=stream_actual_cost,
+                            estimated_cost=estimated_cost, baseline_cost=baseline_cost, actual_cost=stream_actual_cost,
                             savings=savings, latency_us=route_latency_us,
                             usage_input_tokens=stream_usage.input_tokens_total if stream_usage else 0,
                             usage_output_tokens=stream_usage.output_tokens if stream_usage else 0,
@@ -1796,6 +1908,7 @@ def create_app(
                             confidence=1.0,
                             method="passthrough",  # type: ignore[arg-type]
                             estimated_cost=estimated_cost,
+                            baseline_cost=baseline_cost,
                             actual_cost=stream_actual_cost,
                             savings=0.0,
                             latency_us=route_latency_us,
@@ -1833,7 +1946,7 @@ def create_app(
                             tier=tier_value,
                             decision_tier=decision_tier or tier_value,
                             confidence=confidence, method=route_method,  # type: ignore[arg-type]
-                            estimated_cost=estimated_cost, savings=savings,
+                            estimated_cost=estimated_cost, baseline_cost=baseline_cost, savings=savings,
                             latency_us=route_latency_us,
                             transport=_transport_name(native_anthropic_transport),
                             cache_mode=_cache_mode_name(cache_plan),
@@ -1867,6 +1980,7 @@ def create_app(
                             confidence=1.0,
                             method="passthrough",  # type: ignore[arg-type]
                             estimated_cost=estimated_cost,
+                            baseline_cost=baseline_cost,
                             savings=0.0,
                             latency_us=route_latency_us,
                             input_tokens_before=input_tokens_before,
@@ -2112,7 +2226,7 @@ def create_app(
                     tier=tier_value,
                     decision_tier=decision_tier or tier_value,
                     confidence=confidence, method=route_method,  # type: ignore[arg-type]
-                    estimated_cost=estimated_cost, actual_cost=actual_cost,
+                    estimated_cost=estimated_cost, baseline_cost=baseline_cost, actual_cost=actual_cost,
                     savings=savings, latency_us=route_latency_us,
                     usage_input_tokens=usage_metrics.input_tokens_total if usage_metrics else 0,
                     usage_output_tokens=usage_metrics.output_tokens if usage_metrics else 0,
@@ -2150,6 +2264,7 @@ def create_app(
                     confidence=1.0,
                     method="passthrough",  # type: ignore[arg-type]
                     estimated_cost=estimated_cost,
+                    baseline_cost=baseline_cost,
                     actual_cost=actual_cost,
                     savings=0.0,
                     latency_us=route_latency_us,
@@ -2243,7 +2358,7 @@ def create_app(
                     tier=tier_value,
                     decision_tier=decision_tier or tier_value,
                     confidence=confidence, method=route_method,  # type: ignore[arg-type]
-                    estimated_cost=estimated_cost, savings=savings,
+                    estimated_cost=estimated_cost, baseline_cost=baseline_cost, savings=savings,
                     latency_us=route_latency_us,
                     transport=_transport_name(native_anthropic_transport),
                     cache_mode=_cache_mode_name(cache_plan),
@@ -2290,7 +2405,7 @@ def create_app(
                     tier=tier_value,
                     decision_tier=decision_tier or tier_value,
                     confidence=confidence, method=route_method,  # type: ignore[arg-type]
-                    estimated_cost=estimated_cost, savings=savings,
+                    estimated_cost=estimated_cost, baseline_cost=baseline_cost, savings=savings,
                     latency_us=route_latency_us,
                     transport=_transport_name(native_anthropic_transport),
                     cache_mode=_cache_mode_name(cache_plan),
@@ -2352,6 +2467,7 @@ def create_app(
         Route("/v1/sessions", handle_sessions, methods=["GET"]),
         Route("/v1/stats", handle_stats, methods=["GET", "POST"]),
         Route("/v1/selector", handle_selector, methods=["GET", "POST"]),
+        Route("/v1/routing-config", handle_routing_config, methods=["GET", "POST"]),
         Route("/v1/artifacts", handle_artifacts, methods=["GET"]),
         Route("/v1/artifacts/{artifact_id:str}", handle_artifact, methods=["GET"]),
         Route("/v1/feedback", handle_feedback, methods=["GET", "POST"]),

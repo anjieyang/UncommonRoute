@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   fetchHealth,
+  fetchRoutingConfig,
   fetchStats,
   fetchMapping,
   fetchSessions,
   fetchSpend,
   type Health,
+  type RoutingConfigState,
   type Stats,
   type Mapping,
   type Session,
@@ -14,12 +16,13 @@ import {
 import Sidebar from "./components/Sidebar";
 import Overview from "./components/Overview";
 import Routing from "./components/Routing";
+import RoutingConfig from "./components/RoutingConfig";
 import Models from "./components/Models";
 import Sessions from "./components/Sessions";
 import SpendPanel from "./components/Spend";
 import Feedback from "./components/Feedback";
 
-type Page = "overview" | "routing" | "models" | "sessions" | "spend" | "feedback";
+type Page = "overview" | "routing" | "config" | "models" | "sessions" | "spend" | "feedback";
 
 export default function App() {
   const [page, setPage] = useState<Page>("overview");
@@ -28,17 +31,19 @@ export default function App() {
   const [mapping, setMapping] = useState<Mapping | null>(null);
   const [sessions, setSessions] = useState<{ count: number; sessions: Session[] } | null>(null);
   const [spend, setSpend] = useState<Spend | null>(null);
+  const [routingConfig, setRoutingConfig] = useState<RoutingConfigState | null>(null);
   const [ready, setReady] = useState(false);
 
   const refresh = useCallback(async () => {
-    const [h, st, m, ss, sp] = await Promise.all([
-      fetchHealth(), fetchStats(), fetchMapping(), fetchSessions(), fetchSpend(),
+    const [h, st, m, ss, sp, rc] = await Promise.all([
+      fetchHealth(), fetchStats(), fetchMapping(), fetchSessions(), fetchSpend(), fetchRoutingConfig(),
     ]);
     if (h) { setHealth(h); setReady(true); }
     if (st) setStats(st);
     if (m) setMapping(m);
     if (ss) setSessions(ss);
     if (sp) setSpend(sp);
+    if (rc) setRoutingConfig(rc);
   }, []);
 
   useEffect(() => {
@@ -75,6 +80,7 @@ export default function App() {
         <div className="max-w-4xl px-10 py-10">
           {page === "overview" && <Overview stats={stats} health={health} />}
           {page === "routing" && <Routing stats={stats} />}
+          {page === "config" && <RoutingConfig data={routingConfig} onRefresh={refresh} />}
           {page === "models" && <Models mapping={mapping} />}
           {page === "sessions" && <Sessions data={sessions} />}
           {page === "spend" && <SpendPanel spend={spend} onRefresh={refresh} />}
